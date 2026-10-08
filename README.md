@@ -78,3 +78,7 @@ If you find this work useful for your research, please consider citing our paper
 
 ## 🙏 Acknowledgements
 This project is built upon [UniversalFakeDetect](https://github.com/WisconsinAIVision/UniversalFakeDetect). We thank the authors for their open-source contribution.
+# Reference-flow implementation
+
+新增真实参考特征校正与训练期假特征混合模型，训练默认启用；使用 `--method ltd` 运行原基线。
+完整流程、训练／测试命令与限制见 [REFERENCE_FLOW.md](REFERENCE_FLOW.md)。

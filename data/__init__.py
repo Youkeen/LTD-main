@@ -7,8 +7,7 @@ from .datasets import RealFakeDataset
 
 def get_bal_sampler(dataset):
     targets = []
-    for d in dataset.datasets:
-        targets.extend(d.targets)
+    targets = [dataset.labels_dict[p] for p in dataset.total_list]
 
     ratio = np.bincount(targets)
     w = 1. / torch.tensor(ratio, dtype=torch.float)

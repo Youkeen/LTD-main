@@ -44,9 +44,15 @@ if __name__ == '__main__':
 
     model = Trainer(opt)
     
-    train_dataset = RealFakeDataset(opt)
     data_loader = create_dataloader(opt, None)
     val_loader = create_dataloader(val_opt)
+    if opt.method == 'reference_flow':
+        from networks.feature_bank import path_id
+        train_paths = {path_id(p) for p in data_loader.dataset.total_list}
+        val_paths = {path_id(p) for p in val_loader.dataset.total_list}
+        if train_paths & val_paths:
+            raise ValueError('Training and validation paths overlap. Use separate splits before building the bank.')
+    model.initialize_bank(data_loader.dataset)
 
 
     train_writer = SummaryWriter(os.path.join(opt.checkpoints_dir, opt.name, "train"))
@@ -72,6 +78,8 @@ if __name__ == '__main__':
                 end="",
             )
             train_writer.add_scalar('loss', model.loss, model.total_steps)
+            for name, value in getattr(model, 'losses', {}).items():
+                train_writer.add_scalar(name, value.item(), model.total_steps)
             
 
             if model.total_steps in [10,30,50,100,1000,5000,10000] and False: # save models at these iters 
@@ -101,4 +109,3 @@ if __name__ == '__main__':
                 print("Early stopping.")
                 break
         model.train()
-

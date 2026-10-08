@@ -22,12 +22,16 @@ class BaseModel(nn.Module):
             'optimizer' : self.optimizer.state_dict(),
             'total_steps' : self.total_steps,
         }
+        state_dict['arch'] = self.opt.arch
+        if hasattr(self.model, 'checkpoint_config'):
+            state_dict['flow_config'] = self.model.checkpoint_config()
+        os.makedirs(self.save_dir, exist_ok=True)
 
         torch.save(state_dict, save_path)
 
 
     def eval(self):
-        self.model.eval()
+        return self.train(False)
 
     def test(self):
         with torch.no_grad():

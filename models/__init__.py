@@ -1,5 +1,3 @@
-from .clip_models import CLIPModel
-from .imagenet_models import ImagenetModel
 
 
 VALID_NAMES = [
@@ -33,7 +31,11 @@ VALID_NAMES = [
 
 
 
-def get_model(name, num_classes, select_k, training):
+def get_model(name, num_classes, select_k, training, flow_config=None, backbone_state=None):
+    if flow_config is not None:
+        from .reference_flow import ReferenceFlow, FlowConfig
+        return ReferenceFlow(FlowConfig(**flow_config), backbone_state=backbone_state)
+    from .clip_models import CLIPModel
     assert name in VALID_NAMES
     if name.startswith("Imagenet:"):
         # return ImagenetModel(name[9:]) 

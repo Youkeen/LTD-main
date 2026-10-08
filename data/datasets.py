@@ -13,6 +13,11 @@ import pickle
 import os 
 from skimage.io import imread
 from copy import deepcopy
+from functools import partial
+
+
+def identity(image):
+    return image
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -37,10 +42,10 @@ def recursively_read(rootdir, must_contain, exts=["png", "jpg", "JPEG", "jpeg"])
     print(rootdir)
     for r, d, f in os.walk(rootdir, followlinks=True):
         for file in f:
-            if (file.split('.')[1] in exts)  and  (must_contain in os.path.join(r, file)) :
+            if (os.path.splitext(file)[1].lstrip('.').lower() in {e.lower() for e in exts}) and (must_contain in os.path.join(r, file)):
                 # and r.split("/")[-2] in class_labels:
                 if "AIGCDetect_data" in rootdir :
-                    if r.split("/")[-2] in class_labels:
+                    if os.path.basename(os.path.dirname(r)) in class_labels:
                         out.append(os.path.join(r, file))
                 else :
                     out.append(os.path.join(r, file))
@@ -59,7 +64,7 @@ def get_list(path, must_contain=''):
     # shuffle(image_list)
     dict = {}
     for img in image_list[:len(image_list)] :
-        name = img.split("/")[-3]
+        name = os.path.basename(os.path.dirname(os.path.dirname(img)))
         if name not in dict:
             dict[name] = 0
         dict[name] += 1
@@ -100,6 +105,7 @@ class RealFakeDataset(Dataset):
 
 
         self.opt = opt
+        self.return_path = getattr(opt, 'method', 'ltd') == 'reference_flow' and opt.isTrain
         # setting the labels for the dataset
         self.labels_dict = {}
         for i in real_list:
@@ -112,18 +118,18 @@ class RealFakeDataset(Dataset):
         if opt.isTrain:
             crop_func = transforms.RandomCrop(opt.cropSize)
         elif opt.no_crop:
-            crop_func = transforms.Lambda(lambda img: img)
+            crop_func = transforms.Lambda(identity)
         else:
             crop_func = transforms.CenterCrop(opt.cropSize)
 
         if opt.isTrain and not opt.no_flip:
             flip_func = transforms.RandomHorizontalFlip()
         else:
-            flip_func = transforms.Lambda(lambda img: img)
+            flip_func = transforms.Lambda(identity)
         if not opt.isTrain and opt.no_resize:
-            rz_func = transforms.Lambda(lambda img: img)
+            rz_func = transforms.Lambda(identity)
         else:
-            rz_func = transforms.Lambda(lambda img: custom_resize(img, opt))
+            rz_func = transforms.Lambda(partial(custom_resize, opt=opt))
         
         # if opt.isTrain :
         #     # print(opt.jitter_brightness_range.split(","))
@@ -143,7 +149,7 @@ class RealFakeDataset(Dataset):
             print ("using Official CLIP's normalization")
             self.transform = transforms.Compose([
                 rz_func,
-                transforms.Lambda(lambda img: data_augment(img, opt)),
+                transforms.Lambda(partial(data_augment, opt=opt)),
                 crop_func,
                 flip_func,
                 # jitter_func,
@@ -164,6 +170,8 @@ class RealFakeDataset(Dataset):
         label = self.labels_dict[img_path]
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
+        if self.return_path:
+            return img, label, os.path.normcase(os.path.realpath(img_path))
         return img, label
 
 

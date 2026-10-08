@@ -15,6 +15,7 @@ import pickle
 from tqdm import tqdm
 from io import BytesIO
 from copy import deepcopy
+from data.datasets import identity
 #from dataset_paths import  UFD, GenImage, DRCT
 from dataset_paths import   GenImage, DRCT
 import random
@@ -109,8 +110,9 @@ def validate(model, loader, find_thres=False, bs=256):
     with torch.no_grad():
         y_true, y_pred = [], []
         print ("Length of dataset: %d" %(len(loader)))
-        for i, (img, label) in enumerate(loader):
-            in_tens = img.cuda()
+        for i, batch in enumerate(loader):
+            img, label = batch[:2]
+            in_tens = img.to(next(model.parameters()).device)
             output = model(in_tens)
             y_pred.extend(output.sigmoid().flatten().tolist())
             y_true.extend(label.flatten().tolist())
@@ -204,7 +206,7 @@ class RealFakeDataset_for_test(Dataset):
             self.labels_dict[i] = 1
 
         if self.is_resize : rz_func = transforms.Resize((256, 256))
-        else : rz_func = transforms.Lambda(lambda img: img)
+        else : rz_func = transforms.Lambda(identity)
 
         stat_from = "imagenet" if arch.lower().startswith("imagenet") else "clip"
         self.transform = transforms.Compose([
@@ -274,6 +276,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--arch', type=str, default='res50')
     parser.add_argument('--ckpt', type=str, default='./pretrained_weights/fc_weights.pth')
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
 
     parser.add_argument('--result_folder', type=str, default='result', help='')
     parser.add_argument('--batch_size', type=int, default=256)
@@ -289,16 +292,28 @@ if __name__ == '__main__':
 
     os.makedirs(opt.result_folder, exist_ok=True)
 
-    model = get_model(opt.arch, 1, opt.select_k, False)
-    state_dict = torch.load(opt.ckpt, map_location='cpu')["model"]
+    checkpoint = torch.load(opt.ckpt, map_location='cpu', weights_only=True)
+    opt.arch = checkpoint.get('arch', opt.arch)
+    if 'flow_config' in checkpoint:
+        from models.reference_flow import load_flow_checkpoint
+        model = load_flow_checkpoint(checkpoint)
+    else:
+        model = get_model(opt.arch, 1, opt.select_k, False)
+    state_dict = checkpoint['model']
     model.load_state_dict(state_dict)
     print ("Model loaded..")
     model.eval()
-    model.cuda()
+    model.to(opt.device)
 
 #    dataset_paths = UFD
 #    dataset_paths = GenImage
     dataset_paths = DRCT
+    if opt.real_path or opt.fake_path:
+        if not opt.real_path or not opt.fake_path:
+            parser.error('Specify both --real_path and --fake_path.')
+        dataset_paths = [dict(real_path=opt.real_path, fake_path=opt.fake_path,
+                              data_mode=opt.data_mode or 'wang2020',
+                              key='custom', is_resize=True)]
 
     rows = []
     mean_acc, mean_ap = [], []
@@ -336,4 +351,3 @@ if __name__ == '__main__':
     with open(os.path.join(opt.result_folder, f"acc_and_ap.csv"), "a") as f:
         csv_writer = csv.writer(f, delimiter=",")
         csv_writer.writerows(rows)
-
