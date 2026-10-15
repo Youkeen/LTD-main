@@ -17,7 +17,6 @@ from io import BytesIO
 from copy import deepcopy
 from data.datasets import identity
 #from dataset_paths import  UFD, GenImage, DRCT
-from dataset_paths import   GenImage, DRCT
 import random
 import shutil
 from scipy.ndimage import gaussian_filter
@@ -265,10 +264,47 @@ class RealFakeDataset_for_test(Dataset):
 
 
 
+def resolve_dataset_paths(opt):
+    """Resolve command-line paths before loading any machine-specific defaults."""
+    if opt.dataset_root:
+        if opt.real_path or opt.fake_path:
+            raise ValueError('--dataset_root cannot be combined with --real_path/--fake_path.')
+        root = os.path.abspath(os.path.expanduser(opt.dataset_root))
+        if not os.path.isdir(root):
+            raise ValueError(f'Dataset root does not exist: {root}')
+        paths = []
+        for name in sorted(os.listdir(root)):
+            directory = os.path.join(root, name)
+            if opt.dataset == 'drct':
+                if 'inpainting' in name:
+                    continue
+                directory = os.path.join(directory, 'val')
+            if all(os.path.isdir(os.path.join(directory, label)) for label in ('0_real', '1_fake')):
+                paths.append(dict(real_path=directory, fake_path=directory,
+                                  data_mode='wang2020', key=name,
+                                  is_resize=opt.dataset == 'drct'))
+        if not paths:
+            layout = '<generator>/val/{0_real,1_fake}' if opt.dataset == 'drct' else '<generator>/{0_real,1_fake}'
+            raise ValueError(f'No valid datasets found in {root}; expected {layout}.')
+        return paths
+    if opt.real_path or opt.fake_path:
+        if not opt.real_path or not opt.fake_path:
+            raise ValueError('Specify both --real_path and --fake_path.')
+        return [dict(real_path=opt.real_path, fake_path=opt.fake_path,
+                     data_mode=opt.data_mode or 'wang2020', key='custom',
+                     is_resize=opt.dataset == 'drct')]
+    from dataset_paths import GenImage, DRCT
+    return GenImage if opt.dataset == 'genimage' else DRCT
+
+
 if __name__ == '__main__':
 
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--dataset', choices=['drct', 'genimage'], default='drct',
+                        help='dataset layout and preprocessing (genimage: center crop; drct: resize then crop)')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='root containing generator directories, evaluated separately')
     parser.add_argument('--real_path', type=str, default=None, help='dir name or a pickle')
     parser.add_argument('--fake_path', type=str, default=None, help='dir name or a pickle')
     parser.add_argument('--data_mode', type=str, default=None, help='wang2020 or ours')
@@ -288,6 +324,10 @@ if __name__ == '__main__':
 
 
     opt = parser.parse_args()
+    try:
+        dataset_paths = resolve_dataset_paths(opt)
+    except ValueError as error:
+        parser.error(str(error))
 
 
     os.makedirs(opt.result_folder, exist_ok=True)
@@ -305,15 +345,6 @@ if __name__ == '__main__':
     model.eval()
     model.to(opt.device)
 
-#    dataset_paths = UFD
-#    dataset_paths = GenImage
-    dataset_paths = DRCT
-    if opt.real_path or opt.fake_path:
-        if not opt.real_path or not opt.fake_path:
-            parser.error('Specify both --real_path and --fake_path.')
-        dataset_paths = [dict(real_path=opt.real_path, fake_path=opt.fake_path,
-                              data_mode=opt.data_mode or 'wang2020',
-                              key='custom', is_resize=True)]
 
     rows = []
     mean_acc, mean_ap = [], []
