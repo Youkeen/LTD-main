@@ -20,7 +20,7 @@ class FeatureBank:
         self.paths, self.hashes = list(paths), list(hashes)
         self.metadata = metadata or {}
         n = len(self.labels)
-        if (self.features.ndim != 2 or self.semantics.ndim != 2 or
+        if (self.labels.ndim != 1 or self.features.ndim != 2 or self.semantics.ndim != 2 or
                 len(self.features) != n or len(self.semantics) != n or
                 len(paths) != n or len(hashes) != n):
             raise ValueError('Bank tensor and path dimensions do not match.')
@@ -29,8 +29,8 @@ class FeatureBank:
         if not ((self.labels == 0) | (self.labels == 1)).all():
             raise ValueError('Bank labels must be real=0 or fake=1.')
         self.lookup = {p: i for i, p in enumerate(paths)}
-        if (self.labels == 0).sum() < 2 or (self.labels == 1).sum() < 2:
-            raise ValueError('Feature bank needs at least two real and two fake samples.')
+        if n == 0 or any((self.labels == label).sum() < 2 for label in self.labels.unique()):
+            raise ValueError('Feature bank needs at least two samples per included class.')
 
     @torch.no_grad()
     def retrieve(self, queries, paths, label, topk=4, random_choice=False,
@@ -40,6 +40,8 @@ class FeatureBank:
         queries = F.normalize(queries.float(), dim=-1)
         device = queries.device
         indices = torch.where(self.labels == label)[0]
+        if len(indices) == 0:
+            raise ValueError(f'Feature bank has no samples for label {label}.')
         k = min(topk, len(indices))
         scores = queries.new_full((len(queries), k), -torch.inf)
         selected = torch.full((len(queries), k), -1, dtype=torch.long, device=device)
@@ -79,15 +81,23 @@ class FeatureBank:
         return cls(**data)
 
 
-def build_bank(model, dataset, opt):
+@torch.no_grad()
+def build_bank(model, dataset, opt, labels=(0, 1)):
+    if opt.bank_size < 2:
+        raise ValueError('bank_size must be at least 2 per class.')
+    if getattr(dataset, 'data_label', 'train') != 'train':
+        raise ValueError('Feature banks must be built from the training split.')
     # Use official deterministic CLIP preprocessing for stable bank references.
     clean = deepcopy(dataset)
     clean.transform = model.encoder.preprocess
     clean.return_path = True
     generator = torch.Generator().manual_seed(opt.bank_seed)
     indices = []
-    for label in (0, 1):
-        candidates = [i for i, p in enumerate(clean.total_list) if clean.labels_dict[p] == label]
+    for label in labels:
+        candidates = sorted((i for i, p in enumerate(clean.total_list) if clean.labels_dict[p] == label),
+                            key=lambda i: path_id(clean.total_list[i]))
+        if len(candidates) < 2:
+            raise ValueError(f'Training split needs at least two samples for label {label}.')
         order = torch.randperm(len(candidates), generator=generator).tolist()
         indices.extend(candidates[i] for i in order[:opt.bank_size])
     loader = DataLoader(Subset(clean, indices), batch_size=opt.batch_size,

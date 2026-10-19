@@ -130,7 +130,7 @@ class ReferenceFlow(nn.Module):
         flow = F.mse_loss(self.velocity(state, original, time), target)
         mixed_flow = mixed_cls = consistency = original.new_zeros(())
         c = self.config
-        if c.mix_weight > 0 and c.mix_prob > 0 and c.mix_alpha > 0:
+        if donor is not None and donor_anchor is not None and c.mix_weight > 0 and c.mix_prob > 0 and c.mix_alpha > 0:
             donor_state = (1 - time) * donor_anchor + time * donor
             mixed_flow = F.mse_loss(self.velocity(state, original, time, (donor_state, donor)), target)
             mixed_logits = self.rollout(original, donor)

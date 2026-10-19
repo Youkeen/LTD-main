@@ -44,6 +44,11 @@ This repository contains the official implementation of the paper "Layer Consist
 comming soon.
 
 ### Training
+The default `reference_flow` method requires feature banks prepared before training.
+See [REFERENCE_FLOW.md](REFERENCE_FLOW.md) for the preparation command and training examples.
+Set `--real_bank_path` in `train.sh`; optionally add `--fake_bank_path` to enable feature interference.
+Omitting the fake bank disables interference. Use `--method ltd` for the original LTD baseline.
+
 To train the model, run the following command:
 ```bash
 bash train.sh

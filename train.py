@@ -51,7 +51,7 @@ if __name__ == '__main__':
         train_paths = {path_id(p) for p in data_loader.dataset.total_list}
         val_paths = {path_id(p) for p in val_loader.dataset.total_list}
         if train_paths & val_paths:
-            raise ValueError('Training and validation paths overlap. Use separate splits before building the bank.')
+            raise ValueError('Training and validation paths overlap. Use separate splits before training.')
     model.initialize_bank(data_loader.dataset)
 
 

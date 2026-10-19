@@ -5,6 +5,8 @@ import unittest
 import importlib.util
 import sys
 import types
+import contextlib
+import io
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +19,9 @@ from torch.utils.data import Dataset, DataLoader
 from models.reference_flow import ReferenceFlow, FlowConfig, VelocityField, load_flow_checkpoint
 from networks.feature_bank import FeatureBank, build_bank, path_id
 from networks.trainer import Trainer
+from options.train_options import TrainOptions
+from options.bank_options import BankOptions
+from prepare_feature_banks import prepare_feature_banks
 
 
 def identity(x):
@@ -104,6 +109,16 @@ class FlowTests(unittest.TestCase):
         torch.testing.assert_close(loss, parts['classification'] + parts['flow'])
         self.assertEqual(parts['mixed_flow'].item(), 0)
 
+    def test_no_donor_disables_all_interference_losses(self):
+        model = self.model(mix_prob=1.0)
+        x = torch.randn(4, 8)
+        loss, _, parts = model.training_losses(x, x + 1, None, None, torch.zeros(4))
+        torch.testing.assert_close(loss, parts['classification'] + parts['flow'])
+        for name in ('mixed_flow', 'mixed_classification', 'consistency'):
+            self.assertEqual(parts[name].item(), 0)
+        loss.backward()
+        self.assertTrue(any(p.grad is not None for p in model.velocity.parameters()))
+
     def test_chunked_retrieval_self_duplicates_and_donor_class(self):
         semantics = F.normalize(torch.randn(12, 8), dim=-1)
         semantics[2] = semantics[0]
@@ -132,16 +147,25 @@ class FlowTests(unittest.TestCase):
                 mix_prob=0.5, mix_alpha=0.2, flow_weight=1., mix_weight=1., consistency_weight=0.1,
                 fix_backbone=True, optim='adam', lr=0.001, beta1=0.9, weight_decay=0.,
                 gpu_ids=[], checkpoints_dir=root, name='test', bank_size=6, bank_seed=2,
-                bank_path=None, batch_size=4, num_threads=0, anchor_topk=2, donor_topk=3,
+                real_bank_path=os.path.join(root, 'real.pt'), fake_bank_path=os.path.join(root, 'fake.pt'),
+                batch_size=4, num_threads=0, anchor_topk=2, donor_topk=3,
                 duplicate_threshold=0.9999, grad_clip=1.)
             with patch('networks.trainer.get_model', return_value=self.model()):
                 trainer = Trainer(opt)
             dataset = ToyDataset(root)
-            trainer.initialize_bank(dataset)
+            real_bank = build_bank(trainer.model, dataset, opt, labels=(0,))
+            fake_bank = build_bank(trainer.model, dataset, opt, labels=(1,))
+            real_bank.save(opt.real_bank_path)
+            fake_bank.save(opt.fake_bank_path)
+            # Loading for training must never fall back to extraction.
+            with patch('networks.feature_bank.build_bank', side_effect=AssertionError('No training-time build')):
+                trainer.initialize_bank(dataset)
+            self.assertTrue(trainer.use_interference)
             self.assertEqual(len(trainer.bank.paths), 12)
             trainer.set_input(next(iter(DataLoader(dataset, batch_size=4))))
             before = trainer.model.classifier[1].weight.detach().clone()
             trainer.optimize_parameters()
+            self.assertGreater(trainer.losses['mixed_flow'].item(), 0)
             self.assertFalse(torch.equal(before, trainer.model.classifier[1].weight))
             trainer.save_networks('test.pt')
             saved = torch.load(os.path.join(root, 'test', 'test.pt'), weights_only=True)
@@ -152,11 +176,111 @@ class FlowTests(unittest.TestCase):
             trainer.model.eval()
             clone.eval()
             torch.testing.assert_close(trainer.model(dataset.images), clone(dataset.images))
-            opt.bank_path = os.path.join(root, 'test', 'training_bank.pt')
             trainer.initialize_bank(dataset)
+            full_paths = dataset.total_list[:]
             dataset.total_list = dataset.total_list[:-1]
             with self.assertRaisesRegex(ValueError, 'outside'):
                 trainer.initialize_bank(dataset)
+            dataset.total_list = full_paths
+
+            # Real-only training performs only anchor retrieval and still updates weights.
+            opt.fake_bank_path = None
+            trainer.initialize_bank(dataset)
+            self.assertFalse(trainer.use_interference)
+            self.assertTrue((trainer.bank.labels == 0).all())
+            trainer.model.train()
+            before = trainer.model.classifier[1].weight.detach().clone()
+            with patch.object(trainer.bank, 'retrieve', wraps=trainer.bank.retrieve) as retrieve:
+                trainer.optimize_parameters()
+                self.assertEqual(retrieve.call_count, 1)
+                self.assertEqual(retrieve.call_args.args[2], 0)
+            self.assertFalse(torch.equal(before, trainer.model.classifier[1].weight))
+            for name in ('mixed_flow', 'mixed_classification', 'consistency'):
+                self.assertEqual(trainer.losses[name].item(), 0)
+            self.assertFalse(os.path.exists(os.path.join(root, 'test', 'training_bank.pt')))
+
+            opt.fake_bank_path = os.path.join(root, 'missing.pt')
+            with self.assertRaises(FileNotFoundError):
+                trainer.initialize_bank(dataset)
+            opt.fake_bank_path = opt.real_bank_path
+            with self.assertRaisesRegex(ValueError, 'only label 1'):
+                trainer.initialize_bank(dataset)
+            opt.fake_bank_path = None
+            real_bank.metadata['feature_layer'] = 0
+            real_bank.save(opt.real_bank_path)
+            with self.assertRaisesRegex(ValueError, 'backbone/layer'):
+                trainer.initialize_bank(dataset)
+            opt.real_bank_path = None
+            with self.assertRaisesRegex(ValueError, 'real_bank_path'):
+                trainer.initialize_bank(dataset)
+            with patch('networks.trainer.get_model') as get_model:
+                with self.assertRaisesRegex(ValueError, 'real_bank_path'):
+                    Trainer(opt)
+                get_model.assert_not_called()
+
+    def test_single_class_bank_preparation_and_reuse(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset = ToyDataset(root)
+            opt = SimpleNamespace(bank_size=3, bank_seed=2, batch_size=4, num_threads=0)
+            model = self.model()
+            bank = build_bank(model, dataset, opt, labels=(0,))
+            self.assertEqual(len(bank.paths), 3)
+            self.assertTrue((bank.labels == 0).all())
+            # File enumeration order must not change the seeded sample selection.
+            dataset.total_list.reverse()
+            repeated = build_bank(model, dataset, opt, labels=(0,))
+            self.assertEqual(bank.paths, repeated.paths)
+            filename = os.path.join(root, 'real.pt')
+            bank.save(filename)
+            restored = FeatureBank.load(filename)
+            torch.testing.assert_close(bank.features, restored.features)
+            with self.assertRaisesRegex(ValueError, 'no samples for label 1'):
+                restored.retrieve(torch.randn(1, 8), ['other'], 1)
+            dataset.data_label = 'val'
+            with self.assertRaisesRegex(ValueError, 'training split'):
+                build_bank(model, dataset, opt, labels=(0,))
+
+    def test_preparation_entry_point(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataset = ToyDataset(root)
+            dataset_module = types.ModuleType('data.datasets')
+            dataset_module.RealFakeDataset = lambda opt: dataset
+            opt = SimpleNamespace(method='reference_flow', data_label='train', bank_size=3,
+                bank_seed=2, batch_size=4, num_threads=0, gpu_ids=[],
+                real_bank_output=os.path.join(root, 'banks', 'real.pt'), fake_bank_output=None)
+            with patch.dict(sys.modules, {'data.datasets': dataset_module}), patch(
+                    'prepare_feature_banks.create_model', return_value=self.model()):
+                prepare_feature_banks(opt)
+                self.assertEqual(os.listdir(os.path.dirname(opt.real_bank_output)), ['real.pt'])
+                self.assertTrue((FeatureBank.load(opt.real_bank_output).labels == 0).all())
+                opt.fake_bank_output = os.path.join(root, 'banks', 'fake.pt')
+                prepare_feature_banks(opt)
+                self.assertTrue((FeatureBank.load(opt.fake_bank_output).labels == 1).all())
+                opt.fake_bank_output = opt.real_bank_output
+                with self.assertRaisesRegex(ValueError, 'different output paths'):
+                    prepare_feature_banks(opt)
+
+    def test_bank_command_line_contract(self):
+        with patch.object(sys, 'argv', ['train.py', '--real_bank_path', 'real.pt']):
+            opt = TrainOptions().gather_options()
+            self.assertEqual(opt.real_bank_path, 'real.pt')
+            self.assertIsNone(opt.fake_bank_path)
+        with patch.object(sys, 'argv', ['train.py', '--real_bank_path', 'real.pt', '--fake_bank_path', 'fake.pt']):
+            self.assertEqual(TrainOptions().gather_options().fake_bank_path, 'fake.pt')
+        with patch.object(sys, 'argv', ['train.py', '--method', 'ltd']):
+            self.assertIsNone(TrainOptions().gather_options().real_bank_path)
+        for args in ([], ['--fake_bank_path', 'fake.pt']):
+            with patch.object(sys, 'argv', ['train.py'] + args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    TrainOptions().gather_options()
+        with patch.object(sys, 'argv', ['prepare_feature_banks.py', '--real_bank_output', 'real.pt']):
+            opt = BankOptions().gather_options()
+            self.assertEqual(opt.real_bank_output, 'real.pt')
+            self.assertIsNone(opt.fake_bank_output)
+        for args in (['--data_label', 'val'], ['--method', 'ltd'], ['--bank_size', '1']):
+            with patch.object(sys, 'argv', ['prepare_feature_banks.py', '--real_bank_output', 'real.pt'] + args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    BankOptions().gather_options()
 
     def test_actual_clip_hook_and_self_contained_checkpoint(self):
         # Load the repository's actual CLIP architecture without optional tokenizer dependencies.
