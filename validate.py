@@ -171,7 +171,8 @@ class RealFakeDataset_for_test(Dataset):
                         jpeg_quality=None,
                         gaussian_sigma=None,
                         resize_scale=None,
-                        noise_sigma=None):
+                        noise_sigma=None,
+                        resize_short_side=None):
 
         # assert data_mode in ["wang2020", "ours"]
         self.jpeg_quality = jpeg_quality
@@ -204,7 +205,10 @@ class RealFakeDataset_for_test(Dataset):
         for i in fake_list:
             self.labels_dict[i] = 1
 
-        if self.is_resize : rz_func = transforms.Resize((256, 256))
+        if resize_short_side is not None:
+            rz_func = transforms.Resize(resize_short_side, interpolation=transforms.InterpolationMode.BILINEAR)
+        elif self.is_resize:
+            rz_func = transforms.Resize((256, 256))
         else : rz_func = transforms.Lambda(identity)
 
         stat_from = "imagenet" if arch.lower().startswith("imagenet") else "clip"
@@ -316,6 +320,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--result_folder', type=str, default='result', help='')
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--resize_short_side', type=int, default=None,
+                        help='resize the shorter side before center crop; use 256 to match training validation preprocessing')
 
     parser.add_argument('--jpeg_quality', type=int, default=None, help="100, 90, 80, ... 30. Used to test robustness of our model. Not apply if None")
     parser.add_argument('--gaussian_sigma', type=int, default=None, help="0,1,2,3,4.     Used to test robustness of our model. Not apply if None")
@@ -361,7 +367,8 @@ if __name__ == '__main__':
                                     opt.arch,
                                     jpeg_quality=opt.jpeg_quality,
                                     gaussian_sigma=opt.gaussian_sigma,
-                                    resize_scale=opt.resize_scale
+                                    resize_scale=opt.resize_scale,
+                                    resize_short_side=opt.resize_short_side
                                     )
 
         loader = torch.utils.data.DataLoader(dataset, batch_size=opt.batch_size, shuffle=False, num_workers=4)
