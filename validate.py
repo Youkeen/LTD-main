@@ -279,16 +279,25 @@ def resolve_dataset_paths(opt):
         paths = []
         for name in sorted(os.listdir(root)):
             directory = os.path.join(root, name)
+            if not os.path.isdir(directory):
+                continue
             if opt.dataset == 'drct':
                 if 'inpainting' in name:
                     continue
                 directory = os.path.join(directory, 'val')
-            if all(os.path.isdir(os.path.join(directory, label)) for label in ('0_real', '1_fake')):
+            if not os.path.isdir(directory):
+                continue
+            # Group all nested categories under their first-level generator.
+            has_label_pair = any(
+                {'0_real', '1_fake'}.issubset(subdirs)
+                for _, subdirs, _ in os.walk(directory)
+            )
+            if has_label_pair:
                 paths.append(dict(real_path=directory, fake_path=directory,
                                   data_mode='wang2020', key=name,
                                   is_resize=opt.dataset == 'drct'))
         if not paths:
-            layout = '<generator>/val/{0_real,1_fake}' if opt.dataset == 'drct' else '<generator>/{0_real,1_fake}'
+            layout = '<generator>/val/**/{0_real,1_fake}' if opt.dataset == 'drct' else '<generator>/**/{0_real,1_fake}'
             raise ValueError(f'No valid datasets found in {root}; expected {layout}.')
         return paths
     if opt.real_path or opt.fake_path:
@@ -308,7 +317,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', choices=['drct', 'genimage'], default='drct',
                         help='dataset layout and preprocessing (genimage: center crop; drct: resize then crop)')
     parser.add_argument('--dataset_root', type=str, default=None,
-                        help='root containing generator directories, evaluated separately')
+                        help='root containing generator directories; nested labels are grouped by first-level directory')
     parser.add_argument('--real_path', type=str, default=None, help='dir name or a pickle')
     parser.add_argument('--fake_path', type=str, default=None, help='dir name or a pickle')
     parser.add_argument('--data_mode', type=str, default=None, help='wang2020 or ours')
