@@ -364,9 +364,9 @@ if __name__ == '__main__':
     rows = []
     mean_acc, mean_ap = [], []
 
-    with open( os.path.join(opt.result_folder,'ap.txt'), 'a') as f :
+    with open( os.path.join(opt.result_folder,'ap.txt'), 'w') as f :
         f.write(opt.ckpt + "\n")
-    with open( os.path.join(opt.result_folder,'acc0.txt'), 'a') as f :
+    with open( os.path.join(opt.result_folder,'acc0.txt'), 'w') as f :
         f.write(opt.ckpt + "\n")
 
     for dataset_path in (dataset_paths):
@@ -395,6 +395,6 @@ if __name__ == '__main__':
 
     rows.append(['mean', f'{round(np.array(mean_acc).mean()*100, 2)}/{round(np.array(mean_ap).mean()*100, 2)}',
                  round(np.array(mean_acc).mean()*100, 2), round(np.array(mean_ap).mean()*100, 2)])
-    with open(os.path.join(opt.result_folder, f"acc_and_ap.csv"), "a") as f:
+    with open(os.path.join(opt.result_folder, f"acc_and_ap.csv"), "w") as f:
         csv_writer = csv.writer(f, delimiter=",")
         csv_writer.writerows(rows)
