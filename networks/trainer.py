@@ -9,9 +9,9 @@ from models import get_model
 def create_model(opt):
     """Use the same frozen encoder configuration for preparation and training."""
     config = None
-    if opt.method == 'reference_flow':
+    if opt.method in ('reference_flow', 'clip_linear'):
         if not opt.arch.startswith('CLIP:ViT-'):
-            raise ValueError('reference_flow requires a CLIP ViT architecture')
+            raise ValueError('reference_flow and clip_linear require a CLIP ViT architecture')
         config = dict(clip_name=opt.arch[5:], feature_layer=opt.feature_layer,
                       hidden_dim=opt.flow_hidden, steps=opt.flow_steps,
                       mix_prob=opt.mix_prob, mix_alpha=opt.mix_alpha,
@@ -23,6 +23,9 @@ def create_model(opt):
         backbone = {k[len('model.'):]: v for k, v in saved.items() if k.startswith('model.')}
         if not backbone:
             raise ValueError('clip_checkpoint must be an original LTD checkpoint containing model.* CLIP weights.')
+    if opt.method == 'clip_linear':
+        from models.reference_flow import FrozenFeatureLinear, FlowConfig
+        return FrozenFeatureLinear(FlowConfig(**config), backbone_state=backbone)
     return get_model(opt.arch, 1, opt.select_k, True, flow_config=config, backbone_state=backbone)
 
 
@@ -40,7 +43,7 @@ class Trainer(BaseModel):
         self.use_interference = False
         # torch.nn.init.normal_(self.model.fc.weight.data, 0.0, opt.init_gain)
 
-        if opt.fix_backbone or opt.method == 'reference_flow':
+        if opt.fix_backbone or opt.method in ('reference_flow', 'clip_linear'):
             params = []
             for _, p in self.model.named_parameters():
                 if p.requires_grad: 

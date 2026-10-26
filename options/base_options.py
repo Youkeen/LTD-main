@@ -11,7 +11,7 @@ class BaseOptions():
     def initialize(self, parser):
         parser.add_argument('--mode', default='binary')
         parser.add_argument('--arch', type=str, default='CLIP:ViT-L/14', help='CLIP ViT architecture')
-        parser.add_argument('--method', choices=['reference_flow', 'ltd'], default='reference_flow')
+        parser.add_argument('--method', choices=['reference_flow', 'clip_linear', 'ltd'], default='reference_flow')
         parser.add_argument('--clip_checkpoint', default=None, help='optional original LTD checkpoint supplying frozen CLIP weights only')
         parser.add_argument('--feature_layer', type=int, default=19)
         parser.add_argument('--flow_hidden', type=int, default=512)

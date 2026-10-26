@@ -146,10 +146,35 @@ class ReferenceFlow(nn.Module):
         return asdict(self.config)
 
 
+class FrozenFeatureLinear(nn.Module):
+    """Linear probe of the exact normalized intermediate feature used by flow."""
+    def __init__(self, config=None, encoder=None, backbone_state=None):
+        super().__init__()
+        self.config = config or FlowConfig()
+        self.encoder = encoder if encoder is not None else FrozenCLIP(
+            self.config.clip_name, self.config.feature_layer, backbone_state)
+        self.encoder.requires_grad_(False)
+        self.classifier = nn.Linear(self.encoder.feature_dim, 1)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
+    def forward(self, images):
+        with torch.no_grad():
+            features, _ = self.encoder(images)
+        return self.classifier(features)
+
+    def checkpoint_config(self):
+        return asdict(self.config)
+
+
 def load_flow_checkpoint(checkpoint):
     """Restore entirely from the saved checkpoint, without downloading CLIP."""
     prefix = 'encoder.backbone.'
     backbone = {k[len(prefix):]: v for k, v in checkpoint['model'].items() if k.startswith(prefix)}
-    model = ReferenceFlow(FlowConfig(**checkpoint['flow_config']), backbone_state=backbone)
+    model_class = FrozenFeatureLinear if checkpoint.get('method') == 'clip_linear' else ReferenceFlow
+    model = model_class(FlowConfig(**checkpoint['flow_config']), backbone_state=backbone)
     model.load_state_dict(checkpoint['model'], strict=True)
     return model

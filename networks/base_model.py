@@ -23,6 +23,7 @@ class BaseModel(nn.Module):
             'total_steps' : self.total_steps,
         }
         state_dict['arch'] = self.opt.arch
+        state_dict['method'] = self.opt.method
         if hasattr(self.model, 'checkpoint_config'):
             state_dict['flow_config'] = self.model.checkpoint_config()
         os.makedirs(self.save_dir, exist_ok=True)

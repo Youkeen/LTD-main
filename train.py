@@ -46,7 +46,7 @@ if __name__ == '__main__':
     
     data_loader = create_dataloader(opt, None)
     val_loader = create_dataloader(val_opt)
-    if opt.method == 'reference_flow':
+    if opt.method in ('reference_flow', 'clip_linear'):
         from networks.feature_bank import path_id
         train_paths = {path_id(p) for p in data_loader.dataset.total_list}
         val_paths = {path_id(p) for p in val_loader.dataset.total_list}

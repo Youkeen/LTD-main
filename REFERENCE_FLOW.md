@@ -98,6 +98,35 @@ python validate.py --ckpt ./checkpoints/reference_flow_v1/best --real_path D:/YO
 
 ## 消融与检查
 
+### 三组受控对照
+
+`clip_linear` 使用与 flow 相同的冻结 CLIP 中间层归一化特征，仅训练线性分类头。
+它不需要特征库，checkpoint 可直接交给 `validate.py` 自动识别。
+
+在原实验工作目录中运行（Linux）：
+
+```bash
+python -m unittest test_linear_ablation -v
+python run_flow_ablation.py --reference-opt ./checkpoints/reference_flow_10k/opt.txt --genimage-root /data1/yinyongqing/Data/GenImage --prefix ablation_v1 --dry-run
+python run_flow_ablation.py --reference-opt ./checkpoints/reference_flow_10k/opt.txt --genimage-root /data1/yinyongqing/Data/GenImage --prefix ablation_v1
+```
+
+脚本读取原 opt.txt 的训练参数，依次训练并评估 A_flow、B_linear、C_no_flow_loss。
+A 保留原 flow 配置；B 仅使用冻结特征与线性头；C 仅将 flow_weight 改为 0，
+保留原混合策略及其分类/一致性损失。所有训练使用现有入口的固定种子 3000。
+每组以源域验证准确率保存的 best 做测试，不根据目标域结果挑选 checkpoint 或阈值。
+主要比较固定阈值 0.5 的 ACC、AP，以及 acc0.txt 中的真假图准确率。
+CSV 最后一列仍是原验证器的事后测试集阈值结果，不用它选择实验。
+
+脚本要求 sd1_4 数据模式、独立 train/val 下的 0_real/1_fake 目录、224 裁剪和
+bilinear 缩放；沿用原数据路径、库路径、CLIP 初始化、训练轮数、batch size 和学习率。
+原 opt.txt 不要修改；重复实验请更换 prefix，已有输出目录会被拒绝覆盖。
+若原配置省略 clip_checkpoint，各组使用当前环境的官方 CLIP；应保持与建库时权重一致。
+三个实验按顺序执行，遇到错误会停止。GenImage 根目录应仅包含预期评估数据。
+可添加 `--experiments B` 仅跑线性基线，或 `--experiments A C` 只比较速度监督。
+也可直接使用 `train.py --method clip_linear`；去掉速度监督则使用
+`train.py --method reference_flow --flow_weight 0`，其余训练参数保持一致。
+
 - 省略 `--fake_bank_path`：不加载虚假库，去掉干扰分支；已有两库时也可用 `--mix_weight 0`。
 - `--flow_steps 1` / `2` / `4`：各自重新训练，比较单步与多步。
 - `--flow_weight 0`：去掉速度监督，仅保留分类及启用的混合约束。
