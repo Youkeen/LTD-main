@@ -13,7 +13,11 @@ class BaseOptions():
         parser.add_argument('--arch', type=str, default='CLIP:ViT-L/14', help='CLIP ViT architecture')
         parser.add_argument('--method', choices=['reference_flow', 'clip_linear', 'ltd'], default='reference_flow')
         parser.add_argument('--clip_checkpoint', default=None, help='optional original LTD checkpoint supplying frozen CLIP weights only')
-        parser.add_argument('--feature_layer', type=int, default=19)
+        parser.add_argument('--feature_layer', type=int, default=19,
+                            help='zero-based single layer, used when --feature_layers is omitted')
+        parser.add_argument('--feature_layers', type=int, nargs='+', default=None,
+                            help='fixed increasing zero-based layers to normalize separately and concatenate; '
+                                 'e.g. 11 12 13 14 15; overrides --feature_layer')
         parser.add_argument('--flow_hidden', type=int, default=512)
         parser.add_argument('--flow_steps', type=int, default=2)
         parser.add_argument('--mix_prob', type=float, default=0.5)

@@ -13,6 +13,7 @@ def create_model(opt):
         if not opt.arch.startswith('CLIP:ViT-'):
             raise ValueError('reference_flow and clip_linear require a CLIP ViT architecture')
         config = dict(clip_name=opt.arch[5:], feature_layer=opt.feature_layer,
+                      feature_layers=getattr(opt, 'feature_layers', None),
                       hidden_dim=opt.flow_hidden, steps=opt.flow_steps,
                       mix_prob=opt.mix_prob, mix_alpha=opt.mix_alpha,
                       flow_weight=opt.flow_weight, mix_weight=opt.mix_weight,
@@ -39,6 +40,9 @@ class Trainer(BaseModel):
         if opt.method == 'reference_flow' and not opt.real_bank_path:
             raise ValueError('--real_bank_path is required; run prepare_feature_banks.py before training.')
         self.model = create_model(opt)
+        if opt.method in ('reference_flow', 'clip_linear'):
+            print(f'Frozen CLIP layers (zero-based): {self.model.config.selected_layers}; '
+                  f'joint feature dimension: {self.model.encoder.feature_dim}')
         self.bank = None
         self.use_interference = False
         # torch.nn.init.normal_(self.model.fc.weight.data, 0.0, opt.init_gain)
@@ -123,9 +127,10 @@ class Trainer(BaseModel):
         if self.opt.method != 'reference_flow':
             return
         from networks.feature_bank import FeatureBank, path_id
+        from models.reference_flow import feature_bank_metadata
         if not self.opt.real_bank_path:
             raise ValueError('--real_bank_path is required; run prepare_feature_banks.py before training.')
-        expected = dict(clip_name=self.model.config.clip_name, feature_layer=self.model.config.feature_layer)
+        expected = feature_bank_metadata(self.model.config)
         training_paths = {path_id(p): dataset.labels_dict[p] for p in dataset.total_list}
         banks = []
         for label, path in ((0, self.opt.real_bank_path), (1, self.opt.fake_bank_path)):
@@ -133,7 +138,9 @@ class Trainer(BaseModel):
                 continue
             bank = FeatureBank.load(path)
             if bank.metadata != expected:
-                raise ValueError('Bank backbone/layer does not match this model.')
+                raise ValueError(f'Bank representation does not match this model: '
+                                 f'expected {expected}, got {bank.metadata}. '
+                                 'Rebuild banks using the same --feature_layers/--feature_layer settings.')
             if not (bank.labels == label).all():
                 raise ValueError(f'Bank at {path} must contain only label {label} samples.')
             if bank.features.shape[1] != self.model.encoder.feature_dim:

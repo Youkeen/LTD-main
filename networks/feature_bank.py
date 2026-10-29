@@ -120,5 +120,6 @@ def build_bank(model, dataset, opt, labels=(0, 1)):
     print()
     if not features:
         raise ValueError('Training dataset is empty.')
-    metadata = dict(clip_name=model.config.clip_name, feature_layer=model.config.feature_layer)
+    from models.reference_flow import feature_bank_metadata
+    metadata = feature_bank_metadata(model.config)
     return FeatureBank(torch.cat(features), torch.cat(semantics), torch.cat(labels), paths, hashes, metadata)

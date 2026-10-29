@@ -6,8 +6,17 @@
 
 ## 模型流程
 
-训练图像 → 冻结 CLIP → 固定第 20 个 block 的 CLS 特征（零起始索引 19）。
-不使用层选择、层间差分或原 LTD 的双分支 Transformer。
+训练图像 → 冻结 CLIP → 固定层的 CLS 特征。
+默认保留单层（零起始索引 19），便于复现原速度场实验。
+新方案在建库和训练时同时指定 `--feature_layers 11 12 13 14 15`，
+提取这五个零起始索引的 block（按一开始计数为第 12～16 个）。
+每层独立 LayerNorm，再按深度顺序拼接，得到 5120 维联合特征。
+该参数覆盖 `--feature_layer`，仅用于 `reference_flow` 和 `clip_linear`。
+不使用自适应层选择、层间差分、额外位置编码或原 LTD 的双分支 Transformer。
+
+多层方案共用一个速度场，真实参考由同一批邻居及同一组检索权重构造。
+路径插值、时间条件、两步反向 Euler 校正、干扰混合和损失保持原逻辑。
+两步配置下，分类器输入为两步预测速度与总校正量的拼接，共 15360 维。
 
 1. 在独立的准备阶段，用确定性的 CLIP 预处理提取训练集特征，默认每类最多 4096 张。
    真实库和虚假库分别保存；训练启动时只加载指定路径，不再自动建库。
@@ -36,6 +45,34 @@
 也不预设“假图一定需要更大校正”；真假关系由分类头学习。
 
 ## 训练
+
+### 固定 11～15 层实验
+
+以下 PowerShell 命令在包含 `train.py` 的目录运行；替换数据路径。
+使用独立的新库名和实验名，单层库不能用于五层模型。
+
+```powershell
+python prepare_feature_banks.py --method reference_flow --arch CLIP:ViT-L/14 --feature_layers 11 12 13 14 15 --data_mode sd1_4 --wang2020_data_path D:/YOUR_DATA --real_bank_output ./feature_banks/real_layers11_15.pt --fake_bank_output ./feature_banks/fake_layers11_15.pt --bank_size 4096 --batch_size 16 --num_threads 0 --clip_checkpoint ./checkpoints/DRCT_sdv1.4.pth
+```
+
+```powershell
+python train.py --method reference_flow --arch CLIP:ViT-L/14 --feature_layers 11 12 13 14 15 --data_mode sd1_4 --wang2020_data_path D:/YOUR_DATA --real_bank_path ./feature_banks/real_layers11_15.pt --fake_bank_path ./feature_banks/fake_layers11_15.pt --name reference_flow_layers11_15 --checkpoints_dir ./checkpoints --batch_size 16 --num_threads 0 --niter 5 --lr 0.00005 --fix_backbone --clip_checkpoint ./checkpoints/DRCT_sdv1.4.pth
+```
+
+若原实验使用官方 CLIP，两个命令均省略 `--clip_checkpoint`；否则使用原实验相同的权重。
+若原实验未使用干扰混合，建库省略 `--fake_bank_output`，训练省略 `--fake_bank_path`。
+其它超参数应与原实验保持一致，示例 batch size 不代表必须改为 16。
+
+验证自动从 checkpoint 恢复层列表，无需再次指定层数或特征库：
+
+```powershell
+python validate.py --ckpt ./checkpoints/reference_flow_layers11_15/best --real_path D:/YOUR_TEST --fake_path D:/YOUR_TEST --data_mode wang2020 --resize_short_side 256 --batch_size 16 --device cuda --result_folder ./results/reference_flow_layers11_15
+```
+
+旧单层 checkpoint 可继续加载；新旧库会按 CLIP、层顺序及表示格式校验。
+旧单层对照不传 `--feature_layers`，继续使用 `--feature_layer 19`。
+
+### 原单层实验
 
 工作目录是包含 `train.py` 的 `LTD-main` 子目录，安装原 `requirements.txt` 中的依赖。
 示例使用 `sd1_4` 数据布局：
@@ -68,7 +105,7 @@ python train.py --method reference_flow --arch CLIP:ViT-L/14 --data_mode sd1_4 -
 训练数据仍然包含真实和虚假图像，虚假库可选并不意味着只使用真实图像训练分类器。
 
 两个命令的最后一个参数都可省略，此时按原项目逻辑加载／下载官方 CLIP。
-建库与训练必须使用相同的 `--arch`、`--feature_layer`、CLIP 权重和训练数据路径。
+建库与训练必须使用相同的 `--arch`、`--feature_layer` / `--feature_layers`、CLIP 权重和训练数据路径。
 `--clip_checkpoint` 需要原始 LTD 格式 checkpoint，且其 CLIP 必须与 `--arch` 一致。
 ProGAN 布局使用 `--data_mode wang2020`，目录仍为 `train/progan` 和 `test/progan`。
 `ours` 模式继续使用分别存放 train.pickle / val.pickle 的真实和假图路径清单。
@@ -134,9 +171,10 @@ bilinear 缩放；沿用原数据路径、库路径、CLIP 初始化、训练轮
 - `--method ltd`：原始 LTD 基线。
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m unittest test_multilayer_flow test_linear_ablation -v
 ```
 
-测试使用小型冻结编码器和合成样本，覆盖流方向、隐藏混合、梯度隔离、检索排除、
-正常／干扰损失、训练更新、库复用和 checkpoint 一致性。不代表真实数据上的泛化结果。
+测试使用小型 CLIP 架构和合成样本，无需下载权重，覆盖多层提取和逐层归一化、
+梯度隔离、检索排除、正常／干扰训练更新、库配置校验及新旧 checkpoint 恢复。
+不代表真实数据上的泛化结果。
 之后仍需对比同参数单步回归、静态锚点差异和普通 Mixup；这些基线未在此版本实现。

@@ -1,5 +1,6 @@
 """Reference-supervised feature flow. Banks and hidden mixup are training-only."""
 from dataclasses import dataclass, asdict
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -9,7 +10,7 @@ from torch.nn import functional as F
 @dataclass
 class FlowConfig:
     clip_name: str = 'ViT-L/14'
-    feature_layer: int = 19  # zero-based, fixed; no inter-layer differences
+    feature_layer: int = 19  # legacy single-layer configuration; zero-based
     hidden_dim: int = 512
     steps: int = 2
     mix_prob: float = 0.5
@@ -17,11 +18,34 @@ class FlowConfig:
     flow_weight: float = 1.0
     mix_weight: float = 1.0
     consistency_weight: float = 0.1
+    feature_layers: Optional[Tuple[int, ...]] = None
+
+    def __post_init__(self):
+        if self.feature_layers is not None:
+            self.feature_layers = tuple(self.feature_layers)
+        layers = self.selected_layers
+        if (not layers or any(type(layer) is not int or layer < 0 for layer in layers)
+                or tuple(sorted(set(layers))) != layers):
+            raise ValueError('Feature layers must be nonempty, unique, increasing zero-based integers.')
+
+    @property
+    def selected_layers(self):
+        return self.feature_layers if self.feature_layers is not None else (self.feature_layer,)
+
+
+def feature_bank_metadata(config):
+    """Describe the frozen representation; retain compatibility with old single-layer banks."""
+    layers = config.selected_layers
+    if len(layers) == 1:
+        return dict(clip_name=config.clip_name, feature_layer=layers[0])
+    return dict(clip_name=config.clip_name, feature_layers=list(layers),
+                feature_normalization='per_layer_layer_norm', feature_layout='concat')
 
 
 class FrozenCLIP(nn.Module):
-    def __init__(self, name, layer, state_dict=None):
+    def __init__(self, name, layer, state_dict=None, *, layers=None):
         super().__init__()
+        self.feature_layers = FlowConfig(feature_layer=layer, feature_layers=layers).selected_layers
         from .clip import clip
         if state_dict is None:
             self.backbone, self.preprocess = clip.load(name, device='cpu')
@@ -32,26 +56,35 @@ class FrozenCLIP(nn.Module):
         visual = self.backbone.visual
         if not hasattr(visual, 'transformer'):
             raise ValueError('Reference flow requires a CLIP ViT backbone.')
-        if not 0 <= layer < len(visual.transformer.resblocks):
-            raise ValueError('feature_layer is outside the CLIP transformer.')
-        self.feature_dim = visual.ln_post.normalized_shape[0]
-        self._feature = None
-        visual.transformer.resblocks[layer].register_forward_hook(self._capture)
+        if any(index >= len(visual.transformer.resblocks) for index in self.feature_layers):
+            raise ValueError('Selected feature layer is outside the CLIP transformer.')
+        self.layer_dim = visual.ln_post.normalized_shape[0]
+        self.feature_dim = self.layer_dim * len(self.feature_layers)
+        self._features = {}
+        from functools import partial
+        for index in self.feature_layers:
+            visual.transformer.resblocks[index].register_forward_hook(partial(self._capture, index))
         self.requires_grad_(False)
         self.eval()
 
-    def _capture(self, module, inputs, output):
-        self._feature = output[0].detach().float()
+    def _capture(self, index, module, inputs, output):
+        # CLIP residual blocks return [tokens, batch, channels]; select CLS.
+        self._features[index] = output[0].detach().float()
 
     def train(self, mode=True):
         return super().train(False)
 
     @torch.no_grad()
     def forward(self, images):
-        semantic = F.normalize(self.backbone.encode_image(images).float(), dim=-1)
-        # Unit RMS retains channel structure and gives flow MSE a stable scale.
-        feature = F.layer_norm(self._feature, (self.feature_dim,))
-        self._feature = None
+        self._features.clear()
+        try:
+            semantic = F.normalize(self.backbone.encode_image(images).float(), dim=-1)
+            # Normalize each layer independently, then concatenate in depth order.
+            # No layer differences or extra positional embeddings are introduced.
+            feature = torch.cat([F.layer_norm(self._features[index], (self.layer_dim,))
+                                 for index in self.feature_layers], dim=-1)
+        finally:
+            self._features.clear()
         return feature, semantic
 
 
@@ -84,7 +117,8 @@ class ReferenceFlow(nn.Module):
             raise ValueError('Invalid flow steps, hidden size or mixup parameters.')
         if min(c.flow_weight, c.mix_weight, c.consistency_weight) < 0:
             raise ValueError('Loss weights must be nonnegative.')
-        self.encoder = encoder if encoder is not None else FrozenCLIP(c.clip_name, c.feature_layer, backbone_state)
+        self.encoder = encoder if encoder is not None else FrozenCLIP(
+            c.clip_name, c.feature_layer, backbone_state, layers=c.feature_layers)
         self.encoder.requires_grad_(False)
         dim = self.encoder.feature_dim
         self.velocity = VelocityField(dim, c.hidden_dim, c.mix_prob, c.mix_alpha)
@@ -152,7 +186,8 @@ class FrozenFeatureLinear(nn.Module):
         super().__init__()
         self.config = config or FlowConfig()
         self.encoder = encoder if encoder is not None else FrozenCLIP(
-            self.config.clip_name, self.config.feature_layer, backbone_state)
+            self.config.clip_name, self.config.feature_layer, backbone_state,
+            layers=self.config.feature_layers)
         self.encoder.requires_grad_(False)
         self.classifier = nn.Linear(self.encoder.feature_dim, 1)
 
