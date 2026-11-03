@@ -12,6 +12,14 @@ def path_id(path):
     return os.path.normcase(os.path.realpath(path))
 
 
+def file_hash(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class FeatureBank:
     def __init__(self, features, semantics, labels, paths, hashes, metadata=None):
         self.features = features.float().cpu()
@@ -29,6 +37,7 @@ class FeatureBank:
         if not ((self.labels == 0) | (self.labels == 1)).all():
             raise ValueError('Bank labels must be real=0 or fake=1.')
         self.lookup = {p: i for i, p in enumerate(paths)}
+        self._query_hashes = dict(zip(self.paths, self.hashes))
         if n == 0 or any((self.labels == label).sum() < 2 for label in self.labels.unique()):
             raise ValueError('Feature bank needs at least two samples per included class.')
 
@@ -45,7 +54,13 @@ class FeatureBank:
         k = min(topk, len(indices))
         scores = queries.new_full((len(queries), k), -torch.inf)
         selected = torch.full((len(queries), k), -1, dtype=torch.long, device=device)
-        query_hashes = [self.hashes[self.lookup[p]] if p in self.lookup else None for p in paths]
+        # Queries outside the bank also need hash exclusion (e.g. a copied fake
+        # file or a real query when bank_size selects a subset). Cache identifiers
+        # only; image features and semantic neighbors are still computed online.
+        for p in paths:
+            if p not in self._query_hashes and os.path.isfile(p):
+                self._query_hashes[p] = file_hash(p)
+        query_hashes = [self._query_hashes.get(p) for p in paths]
         for start in range(0, len(indices), chunk_size):
             ids = indices[start:start + chunk_size]
             sims = queries @ self.semantics[ids].to(device).T
@@ -72,7 +87,8 @@ class FeatureBank:
         return reference.to(device), selected.cpu()
 
     def save(self, path):
-        torch.save(vars(self) | {'lookup': None}, path)
+        torch.save({key: getattr(self, key) for key in
+                    ('features', 'semantics', 'labels', 'paths', 'hashes', 'metadata')}, path)
 
     @classmethod
     def load(cls, path):
@@ -83,8 +99,8 @@ class FeatureBank:
 
 @torch.no_grad()
 def build_bank(model, dataset, opt, labels=(0, 1)):
-    if opt.bank_size < 2:
-        raise ValueError('bank_size must be at least 2 per class.')
+    if opt.bank_size < 0 or opt.bank_size == 1:
+        raise ValueError('bank_size must be 0 (all samples) or at least 2 per class.')
     if getattr(dataset, 'data_label', 'train') != 'train':
         raise ValueError('Feature banks must be built from the training split.')
     # Use official deterministic CLIP preprocessing for stable bank references.
@@ -99,7 +115,8 @@ def build_bank(model, dataset, opt, labels=(0, 1)):
         if len(candidates) < 2:
             raise ValueError(f'Training split needs at least two samples for label {label}.')
         order = torch.randperm(len(candidates), generator=generator).tolist()
-        indices.extend(candidates[i] for i in order[:opt.bank_size])
+        chosen = order if opt.bank_size == 0 else order[:opt.bank_size]
+        indices.extend(candidates[i] for i in chosen)
     loader = DataLoader(Subset(clean, indices), batch_size=opt.batch_size,
                         num_workers=opt.num_threads, shuffle=False)
     features, semantics, labels, paths, hashes = [], [], [], [], []
@@ -111,11 +128,7 @@ def build_bank(model, dataset, opt, labels=(0, 1)):
         labels.append(target)
         for p in batch_paths:
             paths.append(path_id(p))
-            with open(p, 'rb') as handle:
-                digest = hashlib.sha256()
-                for block in iter(lambda: handle.read(1024 * 1024), b''):
-                    digest.update(block)
-                hashes.append(digest.hexdigest())
+            hashes.append(file_hash(p))
         print(f'\rBuilding training feature bank: {step + 1}/{len(loader)}', end='', flush=True)
     print()
     if not features:

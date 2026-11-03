@@ -348,6 +348,8 @@ if __name__ == '__main__':
     os.makedirs(opt.result_folder, exist_ok=True)
 
     checkpoint = torch.load(opt.ckpt, map_location='cpu', weights_only=True)
+    if checkpoint.get('training_stage') == 'flow':
+        raise ValueError('This is a stage-1 velocity checkpoint with an untrained classifier. Use the classifier-stage best checkpoint.')
     opt.arch = checkpoint.get('arch', opt.arch)
     if 'flow_config' in checkpoint:
         from models.reference_flow import load_flow_checkpoint

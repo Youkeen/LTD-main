@@ -24,6 +24,8 @@ class BaseModel(nn.Module):
         }
         state_dict['arch'] = self.opt.arch
         state_dict['method'] = self.opt.method
+        state_dict['training_stage'] = getattr(self, 'training_stage', 'classifier')
+        state_dict['stage_epoch'] = getattr(self, 'stage_epoch', 0)
         if hasattr(self.model, 'checkpoint_config'):
             state_dict['flow_config'] = self.model.checkpoint_config()
         os.makedirs(self.save_dir, exist_ok=True)

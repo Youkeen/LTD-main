@@ -1,4 +1,4 @@
-"""Reference-supervised feature flow. Banks and hidden mixup are training-only."""
+"""Two-stage reference flow: fit v(z,t), freeze it, then fit a velocity readout."""
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
 
@@ -10,15 +10,17 @@ from torch.nn import functional as F
 @dataclass
 class FlowConfig:
     clip_name: str = 'ViT-L/14'
-    feature_layer: int = 19  # legacy single-layer configuration; zero-based
+    feature_layer: Optional[int] = None  # explicit single-layer override; zero-based
     hidden_dim: int = 512
-    steps: int = 2
-    mix_prob: float = 0.5
+    steps: int = 4
+    mix_prob: float = 0.0  # legacy checkpoint fields; disabled in version 2
     mix_alpha: float = 0.2
     flow_weight: float = 1.0
-    mix_weight: float = 1.0
-    consistency_weight: float = 0.1
+    mix_weight: float = 0.0
+    consistency_weight: float = 0.0
     feature_layers: Optional[Tuple[int, ...]] = None
+    start_time_prob: float = 0.1
+    architecture_version: int = 2
 
     def __post_init__(self):
         if self.feature_layers is not None:
@@ -27,10 +29,16 @@ class FlowConfig:
         if (not layers or any(type(layer) is not int or layer < 0 for layer in layers)
                 or tuple(sorted(set(layers))) != layers):
             raise ValueError('Feature layers must be nonempty, unique, increasing zero-based integers.')
+        if self.architecture_version not in (1, 2):
+            raise ValueError('Unsupported reference flow architecture version.')
+        if not 0 <= self.start_time_prob <= 1:
+            raise ValueError('start_time_prob must be in [0, 1].')
 
     @property
     def selected_layers(self):
-        return self.feature_layers if self.feature_layers is not None else (self.feature_layer,)
+        if self.feature_layers is not None:
+            return self.feature_layers
+        return (self.feature_layer,) if self.feature_layer is not None else (11, 12, 13, 14, 15)
 
 
 def feature_bank_metadata(config):
@@ -89,23 +97,13 @@ class FrozenCLIP(nn.Module):
 
 
 class VelocityField(nn.Module):
-    def __init__(self, dim, hidden, probability, alpha):
+    def __init__(self, dim, hidden):
         super().__init__()
-        self.hidden = nn.Sequential(nn.Linear(2 * dim + 1, hidden), nn.LayerNorm(hidden), nn.GELU())
+        self.hidden = nn.Sequential(nn.Linear(dim + 1, hidden), nn.LayerNorm(hidden), nn.GELU())
         self.output = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, dim))
-        self.probability, self.alpha = probability, alpha
 
-    def forward(self, state, original, time, donor=None):
-        h = self.hidden(torch.cat((state, original, time), dim=-1))
-        if self.training and donor is not None and self.probability > 0:
-            donor_state, donor_original = donor
-            # Recompute donor hidden features with current weights, without gradients.
-            with torch.no_grad():
-                clean = self.hidden(torch.cat((donor_state, donor_original, time), dim=-1))
-            gate = (torch.rand(h.shape[0], 1, device=h.device) < self.probability)
-            alpha = torch.rand_like(h) * self.alpha * gate
-            h = (1 - alpha) * h + alpha * clean
-        return self.output(h)
+    def forward(self, state, time):
+        return self.output(self.hidden(torch.cat((state, time), dim=-1)))
 
 
 class ReferenceFlow(nn.Module):
@@ -113,68 +111,89 @@ class ReferenceFlow(nn.Module):
         super().__init__()
         self.config = config or FlowConfig()
         c = self.config
-        if c.steps < 1 or c.hidden_dim < 1 or not 0 <= c.mix_prob <= 1 or not 0 <= c.mix_alpha <= 1:
-            raise ValueError('Invalid flow steps, hidden size or mixup parameters.')
-        if min(c.flow_weight, c.mix_weight, c.consistency_weight) < 0:
-            raise ValueError('Loss weights must be nonnegative.')
+        if c.architecture_version != 2:
+            raise ValueError('Use load_flow_checkpoint() to restore an old conditional flow.')
+        if c.steps < 1 or c.hidden_dim < 1 or c.flow_weight <= 0:
+            raise ValueError('Flow steps, hidden size and flow_weight must be positive.')
+        if c.mix_prob != 0 or c.mix_weight != 0 or c.consistency_weight != 0:
+            raise ValueError('Two-stage reference flow does not use hidden mixup or consistency losses.')
         self.encoder = encoder if encoder is not None else FrozenCLIP(
             c.clip_name, c.feature_layer, backbone_state, layers=c.feature_layers)
         self.encoder.requires_grad_(False)
         dim = self.encoder.feature_dim
-        self.velocity = VelocityField(dim, c.hidden_dim, c.mix_prob, c.mix_alpha)
-        # Only predicted velocities and net correction, no direct original-feature shortcut.
-        self.classifier = nn.Sequential(nn.LayerNorm((c.steps + 1) * dim),
-                                        nn.Linear((c.steps + 1) * dim, 1))
+        self.velocity = VelocityField(dim, c.hidden_dim)
+        # Full velocity vectors only; total correction is already their scaled sum.
+        # Keep magnitudes available to the readout instead of normalizing each sample.
+        self.classifier = nn.Linear(c.steps * dim, 1)
+        self.set_stage('flow')
+
+    def set_stage(self, stage):
+        if stage not in ('flow', 'classifier'):
+            raise ValueError('Stage must be flow or classifier.')
+        self.training_stage = stage
+        self.encoder.requires_grad_(False)
+        self.velocity.requires_grad_(stage == 'flow')
+        self.classifier.requires_grad_(stage == 'classifier')
+        self.zero_grad(set_to_none=True)
+        self.train(self.training)
+        return self
 
     def train(self, mode=True):
         super().train(mode)
         self.encoder.eval()
+        self.velocity.train(mode and self.training_stage == 'flow')
+        self.classifier.train(mode and self.training_stage == 'classifier')
         return self
 
     @torch.no_grad()
     def extract(self, images):
         return self.encoder(images)
 
-    def rollout(self, original, donor=None):
+    def integrate(self, original):
+        """Actual predicted reverse Euler path, with no reference/bank inputs."""
         state, velocities = original, []
-        donor_state = donor
         for step in range(self.config.steps):
             time = original.new_full((len(original), 1), 1 - step / self.config.steps)
-            pair = None if donor is None else (donor_state, donor)
-            velocity = self.velocity(state, original, time, pair)
+            velocity = self.velocity(state, time)
             velocities.append(velocity)
             # z(t)=(1-t)*reference+t*input: integrate from t=1 down to 0.
             state = state - velocity / self.config.steps
-            if donor is not None:
-                with torch.no_grad():
-                    donor_state = donor_state - self.velocity(donor_state, donor, time) / self.config.steps
-        representation = torch.cat(velocities + [original - state], dim=-1)
-        return self.classifier(representation).flatten()
+        return torch.stack(velocities, dim=1), state
+
+    def rollout_features(self, original):
+        velocities, _ = self.integrate(original)
+        return velocities.flatten(1)
+
+    def rollout(self, original):
+        return self.classifier(self.rollout_features(original)).flatten()
 
     def forward(self, images):
         features, _ = self.extract(images)
         return self.rollout(features).unsqueeze(1)
 
-    def training_losses(self, original, anchor, donor, donor_anchor, labels):
-        time = torch.rand(len(original), 1, device=original.device)
+    def flow_loss(self, original, anchor, time=None):
+        """Stage 1: labels and classifier are deliberately absent from this API."""
+        if self.training_stage != 'flow':
+            raise RuntimeError('Flow training requires stage=flow.')
+        original, anchor = original.detach(), anchor.detach()
+        if time is None:
+            time = torch.rand(len(original), 1, device=original.device, dtype=original.dtype)
+            # The exact t=1 start used by inference receives explicit supervision.
+            at_start = torch.rand_like(time) < self.config.start_time_prob
+            time = torch.where(at_start, torch.ones_like(time), time)
         state = (1 - time) * anchor + time * original
         target = original - anchor
-        logits = self.rollout(original)
-        classification = F.binary_cross_entropy_with_logits(logits, labels.float())
-        flow = F.mse_loss(self.velocity(state, original, time), target)
-        mixed_flow = mixed_cls = consistency = original.new_zeros(())
-        c = self.config
-        if donor is not None and donor_anchor is not None and c.mix_weight > 0 and c.mix_prob > 0 and c.mix_alpha > 0:
-            donor_state = (1 - time) * donor_anchor + time * donor
-            mixed_flow = F.mse_loss(self.velocity(state, original, time, (donor_state, donor)), target)
-            mixed_logits = self.rollout(original, donor)
-            mixed_cls = F.binary_cross_entropy_with_logits(mixed_logits, labels.float())
-            consistency = F.mse_loss(mixed_logits.sigmoid(), logits.detach().sigmoid())
-        total = classification + c.flow_weight * flow + c.mix_weight * (
-            mixed_cls + c.flow_weight * mixed_flow + c.consistency_weight * consistency)
-        return total, logits, dict(classification=classification, flow=flow,
-                                  mixed_classification=mixed_cls, mixed_flow=mixed_flow,
-                                  consistency=consistency)
+        return F.mse_loss(self.velocity(state, time), target)
+
+    def classification_loss(self, original, labels):
+        """Stage 2: predicted trajectories are detached; only the readout learns."""
+        if self.training_stage != 'classifier':
+            raise RuntimeError('Classification training requires stage=classifier.')
+        with torch.no_grad():
+            representation = self.rollout_features(original)
+        logits = self.classifier(representation).flatten()
+        loss = F.binary_cross_entropy_with_logits(logits, labels.float())
+        return loss, logits
 
     def checkpoint_config(self):
         return asdict(self.config)
@@ -209,7 +228,17 @@ def load_flow_checkpoint(checkpoint):
     """Restore entirely from the saved checkpoint, without downloading CLIP."""
     prefix = 'encoder.backbone.'
     backbone = {k[len(prefix):]: v for k, v in checkpoint['model'].items() if k.startswith(prefix)}
-    model_class = FrozenFeatureLinear if checkpoint.get('method') == 'clip_linear' else ReferenceFlow
-    model = model_class(FlowConfig(**checkpoint['flow_config']), backbone_state=backbone)
+    config = dict(checkpoint['flow_config'])
+    config.setdefault('architecture_version', 1)
+    if checkpoint.get('method') == 'clip_linear':
+        model_class = FrozenFeatureLinear
+    elif config['architecture_version'] == 1:
+        from .reference_flow_legacy import LegacyReferenceFlow
+        model_class = LegacyReferenceFlow
+    else:
+        model_class = ReferenceFlow
+    model = model_class(FlowConfig(**config), backbone_state=backbone)
     model.load_state_dict(checkpoint['model'], strict=True)
+    if isinstance(model, ReferenceFlow):
+        model.set_stage(checkpoint.get('training_stage', 'classifier'))
     return model

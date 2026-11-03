@@ -13,18 +13,20 @@ class BaseOptions():
         parser.add_argument('--arch', type=str, default='CLIP:ViT-L/14', help='CLIP ViT architecture')
         parser.add_argument('--method', choices=['reference_flow', 'clip_linear', 'ltd'], default='reference_flow')
         parser.add_argument('--clip_checkpoint', default=None, help='optional original LTD checkpoint supplying frozen CLIP weights only')
-        parser.add_argument('--feature_layer', type=int, default=19,
-                            help='zero-based single layer, used when --feature_layers is omitted')
+        parser.add_argument('--feature_layer', type=int, default=None,
+                            help='explicit zero-based single layer; default is five layers 11..15')
         parser.add_argument('--feature_layers', type=int, nargs='+', default=None,
                             help='fixed increasing zero-based layers to normalize separately and concatenate; '
                                  'e.g. 11 12 13 14 15; overrides --feature_layer')
         parser.add_argument('--flow_hidden', type=int, default=512)
-        parser.add_argument('--flow_steps', type=int, default=2)
-        parser.add_argument('--mix_prob', type=float, default=0.5)
+        parser.add_argument('--flow_steps', type=int, default=4)
+        parser.add_argument('--start_time_prob', type=float, default=0.1,
+                            help='fraction of FM samples supervised at the exact t=1 inference start')
+        parser.add_argument('--mix_prob', type=float, default=0.0, help='legacy option; must be 0 for two-stage flow')
         parser.add_argument('--mix_alpha', type=float, default=0.2)
         parser.add_argument('--flow_weight', type=float, default=1.0)
-        parser.add_argument('--mix_weight', type=float, default=1.0)
-        parser.add_argument('--consistency_weight', type=float, default=0.1)
+        parser.add_argument('--mix_weight', type=float, default=0.0, help='legacy option; must be 0 for two-stage flow')
+        parser.add_argument('--consistency_weight', type=float, default=0.0, help='legacy option; must be 0 for two-stage flow')
         parser.add_argument('--anchor_topk', type=int, default=4)
         parser.add_argument('--donor_topk', type=int, default=16)
         parser.add_argument('--duplicate_threshold', type=float, default=0.9999)

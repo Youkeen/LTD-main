@@ -1,8 +1,6 @@
-import functools
 import torch
 import torch.nn as nn
-from networks.base_model import BaseModel, init_weights
-import sys
+from networks.base_model import BaseModel
 from models import get_model
 
 
@@ -17,7 +15,8 @@ def create_model(opt):
                       hidden_dim=opt.flow_hidden, steps=opt.flow_steps,
                       mix_prob=opt.mix_prob, mix_alpha=opt.mix_alpha,
                       flow_weight=opt.flow_weight, mix_weight=opt.mix_weight,
-                      consistency_weight=opt.consistency_weight)
+                      consistency_weight=opt.consistency_weight,
+                      start_time_prob=getattr(opt, 'start_time_prob', 0.1))
     backbone = None
     if config is not None and opt.clip_checkpoint:
         saved = torch.load(opt.clip_checkpoint, map_location='cpu', weights_only=True)['model']
@@ -36,7 +35,7 @@ class Trainer(BaseModel):
 
     def __init__(self, opt):
         super(Trainer, self).__init__(opt)
-        self.opt = opt  
+        self.opt = opt
         if opt.method == 'reference_flow' and not opt.real_bank_path:
             raise ValueError('--real_bank_path is required; run prepare_feature_banks.py before training.')
         self.model = create_model(opt)
@@ -44,22 +43,15 @@ class Trainer(BaseModel):
             print(f'Frozen CLIP layers (zero-based): {self.model.config.selected_layers}; '
                   f'joint feature dimension: {self.model.encoder.feature_dim}')
         self.bank = None
-        self.use_interference = False
-        # torch.nn.init.normal_(self.model.fc.weight.data, 0.0, opt.init_gain)
+        self.training_stage = 'flow' if opt.method == 'reference_flow' else 'classifier'
+        self.stage_epoch = 0
+        self.model.to(self.device)
+        self._make_optimizer()
+        self.loss_fn = nn.BCEWithLogitsLoss()
 
-        if opt.fix_backbone or opt.method in ('reference_flow', 'clip_linear'):
-            params = []
-            for _, p in self.model.named_parameters():
-                if p.requires_grad: 
-                    params.append(p) 
-        else:
-            print("Your backbone is not fixed. Are you sure you want to proceed? If this is a mistake, enable the --fix_backbone command during training and rerun")
-            import time 
-            time.sleep(3)
-            params = self.model.parameters()
-
-        
-
+    def _make_optimizer(self):
+        opt = self.opt
+        params = [p for p in self.model.parameters() if p.requires_grad]
         if opt.optim == 'adam':
             self.optimizer = torch.optim.AdamW(params, lr=opt.lr, betas=(opt.beta1, 0.999), weight_decay=opt.weight_decay)
         elif opt.optim == 'sgd':
@@ -67,11 +59,14 @@ class Trainer(BaseModel):
         else:
             raise ValueError("optim should be [adam, sgd]")
 
-        self.loss_fn = nn.BCEWithLogitsLoss()
-
-        self.model.to(self.device)
-        
-
+    def set_stage(self, stage):
+        if self.opt.method != 'reference_flow':
+            raise ValueError('Explicit stages are only used by reference_flow.')
+        self.model.set_stage(stage)
+        self.training_stage, self.stage_epoch = stage, 0
+        if stage == 'classifier':
+            self.bank = None  # Neither classifier training nor inference uses retrieval.
+        self._make_optimizer()  # No velocity parameters/state in the classifier optimizer.
 
     def adjust_learning_rate(self, min_lr=1e-6):
         for param_group in self.optimizer.param_groups:
@@ -97,21 +92,8 @@ class Trainer(BaseModel):
 
     def optimize_parameters(self):
         if self.opt.method == 'reference_flow':
-            if self.bank is None or self.paths is None:
-                raise RuntimeError('Initialize the training feature bank and supply sample paths first.')
-            original, semantic = self.model.extract(self.input)
-            anchor, _ = self.bank.retrieve(semantic, self.paths, 0, self.opt.anchor_topk,
-                                          duplicate_threshold=self.opt.duplicate_threshold)
-            donor = donor_anchor = None
-            if self.use_interference:
-                donor, ids = self.bank.retrieve(semantic, self.paths, 1, self.opt.donor_topk,
-                                               random_choice=True, duplicate_threshold=self.opt.duplicate_threshold)
-                donor_anchor, _ = self.bank.retrieve(self.bank.semantics[ids].to(self.device),
-                    [self.bank.paths[i] for i in ids.tolist()], 0, self.opt.anchor_topk,
-                    duplicate_threshold=self.opt.duplicate_threshold)
-            self.loss, logits, self.losses = self.model.training_losses(
-                original, anchor, donor, donor_anchor, self.label)
-            self.output = logits.unsqueeze(1)
+            self.loss, logits = self.reference_losses(self.input, self.paths, self.label)
+            self.output = None if logits is None else logits.unsqueeze(1)
             self.optimizer.zero_grad(set_to_none=True)
             self.loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], self.opt.grad_clip)
@@ -123,6 +105,22 @@ class Trainer(BaseModel):
         self.loss.backward()
         self.optimizer.step()
 
+    def reference_losses(self, images, paths=None, labels=None):
+        """One FM query per batch in stage 1; bank-free predicted rollout in stage 2."""
+        original, semantic = self.model.extract(images)
+        if self.training_stage == 'flow':
+            if self.bank is None or paths is None:
+                raise RuntimeError('Initialize the real training bank and supply sample paths first.')
+            anchor, _ = self.bank.retrieve(semantic, paths, 0, self.opt.anchor_topk,
+                                          random_choice=True,
+                                          duplicate_threshold=self.opt.duplicate_threshold)
+            flow = self.model.flow_loss(original, anchor)
+            self.losses = dict(flow=flow)
+            return self.model.config.flow_weight * flow, None
+        classification, logits = self.model.classification_loss(original, labels)
+        self.losses = dict(classification=classification)
+        return classification, logits
+
     def initialize_bank(self, dataset):
         if self.opt.method != 'reference_flow':
             return
@@ -132,31 +130,19 @@ class Trainer(BaseModel):
             raise ValueError('--real_bank_path is required; run prepare_feature_banks.py before training.')
         expected = feature_bank_metadata(self.model.config)
         training_paths = {path_id(p): dataset.labels_dict[p] for p in dataset.total_list}
-        banks = []
-        for label, path in ((0, self.opt.real_bank_path), (1, self.opt.fake_bank_path)):
-            if not path:
-                continue
-            bank = FeatureBank.load(path)
-            if bank.metadata != expected:
-                raise ValueError(f'Bank representation does not match this model: '
-                                 f'expected {expected}, got {bank.metadata}. '
-                                 'Rebuild banks using the same --feature_layers/--feature_layer settings.')
-            if not (bank.labels == label).all():
-                raise ValueError(f'Bank at {path} must contain only label {label} samples.')
-            if bank.features.shape[1] != self.model.encoder.feature_dim:
-                raise ValueError('Bank feature dimensions do not match this model.')
-            if any(p not in training_paths or training_paths[p] != int(y)
-                   for p, y in zip(bank.paths, bank.labels)):
-                raise ValueError('Bank contains samples outside the current training split or wrong labels.')
-            banks.append(bank)
-        if len(banks) == 2 and banks[0].semantics.shape[1] != banks[1].semantics.shape[1]:
-            raise ValueError('Real and fake bank semantic dimensions do not match.')
-        # Merge in memory to preserve cross-class hash exclusion during retrieval.
-        self.bank = banks[0] if len(banks) == 1 else FeatureBank(
-            torch.cat([b.features for b in banks]), torch.cat([b.semantics for b in banks]),
-            torch.cat([b.labels for b in banks]), sum([b.paths for b in banks], []),
-            sum([b.hashes for b in banks], []), expected)
-        c = self.model.config
-        self.use_interference = bool(self.opt.fake_bank_path) and c.mix_weight > 0 and c.mix_prob > 0 and c.mix_alpha > 0
-        print(f'Loaded prepared feature banks. Interference: {"enabled" if self.use_interference else "disabled"}.')
+        if self.opt.fake_bank_path:
+            raise ValueError('Two-stage reference_flow uses only --real_bank_path; remove --fake_bank_path.')
+        bank = FeatureBank.load(self.opt.real_bank_path)
+        if bank.metadata != expected:
+            raise ValueError(f'Bank representation does not match this model: '
+                             f'expected {expected}, got {bank.metadata}. '
+                             'Rebuild banks using the same --feature_layers/--feature_layer settings.')
+        if not (bank.labels == 0).all():
+            raise ValueError('The real reference bank must contain only label 0 samples.')
+        if bank.features.shape[1] != self.model.encoder.feature_dim:
+            raise ValueError('Bank feature dimensions do not match this model.')
+        if any(p not in training_paths or training_paths[p] != 0 for p in bank.paths):
+            raise ValueError('Bank contains samples outside the current training split or wrong labels.')
+        self.bank = bank
+        print(f'Loaded {len(bank.paths)} real training references; sampling one from semantic Top-{self.opt.anchor_topk}.')
 

@@ -5,7 +5,8 @@ class TrainOptions(BaseOptions):
     def initialize(self, parser):
         parser = BaseOptions.initialize(self, parser)
         parser.add_argument('--real_bank_path', default=None, help='prepared real training feature bank; required for reference_flow')
-        parser.add_argument('--fake_bank_path', default=None, help='optional prepared fake training feature bank; omit to disable interference')
+        parser.add_argument('--fake_bank_path', default=None, help='legacy option; unsupported by two-stage flow')
+        parser.add_argument('--flow_epochs', type=int, default=5, help='stage 1 epochs of FM-only training')
         parser.add_argument('--earlystop_epoch', type=int, default=5)
         parser.add_argument('--data_aug', action='store_true', help='if specified, perform additional data augmentation (photometric, blurring, jpegging)')
         parser.add_argument('--optim', type=str, default='adam', help='optim to use [sgd, adam]')
@@ -16,7 +17,8 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--last_epoch', type=int, default=-1, help='starting epoch count for scheduler intialization')
         parser.add_argument('--train_split', type=str, default='train', help='train, val, test, etc')
         parser.add_argument('--val_split', type=str, default='val', help='train, val, test, etc')
-        parser.add_argument('--niter', type=int, default=100, help='total epoches')
+        parser.add_argument('--niter', type=int, default=None,
+                            help='classifier epochs after FM (default 5); total epochs for other methods (default 100)')
         parser.add_argument('--beta1', type=float, default=0.9, help='momentum term of adam')
         parser.add_argument('--lr', type=float, default=0.0001, help='initial learning rate for adam')
 
@@ -26,6 +28,15 @@ class TrainOptions(BaseOptions):
 
     def gather_options(self):
         opt = super().gather_options()
+        if opt.niter is None:
+            opt.niter = 5 if opt.method == 'reference_flow' else 100
         if opt.method == 'reference_flow' and not opt.real_bank_path:
             self.parser.error('--real_bank_path is required for reference_flow; run prepare_feature_banks.py first.')
+        if opt.method == 'reference_flow':
+            if opt.flow_epochs < 1 or opt.niter < 1 or opt.flow_weight <= 0:
+                self.parser.error('flow_epochs, niter and flow_weight must be positive for two-stage flow.')
+            if opt.fake_bank_path or opt.mix_prob != 0 or opt.mix_weight != 0 or opt.consistency_weight != 0:
+                self.parser.error('Two-stage flow disables fake-bank interference; remove legacy fake/mix/consistency options.')
+        if opt.flow_steps < 1 or opt.anchor_topk < 1 or not 0 <= opt.start_time_prob <= 1:
+            self.parser.error('flow_steps and anchor_topk must be positive; start_time_prob must be in [0, 1].')
         return opt
