@@ -16,7 +16,8 @@ def create_model(opt):
                       mix_prob=opt.mix_prob, mix_alpha=opt.mix_alpha,
                       flow_weight=opt.flow_weight, mix_weight=opt.mix_weight,
                       consistency_weight=opt.consistency_weight,
-                      start_time_prob=getattr(opt, 'start_time_prob', 0.1))
+                      start_time_prob=getattr(opt, 'start_time_prob', 0.1),
+                      fuse_clip_features=getattr(opt, 'fuse_clip_features', False))
     backbone = None
     if config is not None and opt.clip_checkpoint:
         saved = torch.load(opt.clip_checkpoint, map_location='cpu', weights_only=True)['model']
@@ -42,6 +43,9 @@ class Trainer(BaseModel):
         if opt.method in ('reference_flow', 'clip_linear'):
             print(f'Frozen CLIP layers (zero-based): {self.model.config.selected_layers}; '
                   f'joint feature dimension: {self.model.encoder.feature_dim}')
+            if opt.method == 'reference_flow':
+                readout = 'CLIP + velocities' if self.model.config.fuse_clip_features else 'velocities'
+                print(f'Classifier input: {readout}; dimension: {self.model.classifier.in_features}')
         self.bank = None
         self.training_stage = 'flow' if opt.method == 'reference_flow' else 'classifier'
         self.stage_epoch = 0

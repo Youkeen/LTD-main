@@ -1,4 +1,4 @@
-"""Two-stage reference flow: fit v(z,t), freeze it, then fit a velocity readout."""
+"""Two-stage reference flow with a velocity or fused CLIP/velocity readout."""
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
 
@@ -21,6 +21,7 @@ class FlowConfig:
     feature_layers: Optional[Tuple[int, ...]] = None
     start_time_prob: float = 0.1
     architecture_version: int = 2
+    fuse_clip_features: bool = False
 
     def __post_init__(self):
         if self.feature_layers is not None:
@@ -31,6 +32,8 @@ class FlowConfig:
             raise ValueError('Feature layers must be nonempty, unique, increasing zero-based integers.')
         if self.architecture_version not in (1, 2):
             raise ValueError('Unsupported reference flow architecture version.')
+        if self.fuse_clip_features and self.architecture_version != 2:
+            raise ValueError('CLIP feature fusion requires the two-stage architecture (version 2).')
         if not 0 <= self.start_time_prob <= 1:
             raise ValueError('start_time_prob must be in [0, 1].')
 
@@ -124,7 +127,8 @@ class ReferenceFlow(nn.Module):
         self.velocity = VelocityField(dim, c.hidden_dim)
         # Full velocity vectors only; total correction is already their scaled sum.
         # Keep magnitudes available to the readout instead of normalizing each sample.
-        self.classifier = nn.Linear(c.steps * dim, 1)
+        # Optionally prepend the encoder features for a direct CLIP classification path.
+        self.classifier = nn.Linear((c.steps + int(c.fuse_clip_features)) * dim, 1)
         self.set_stage('flow')
 
     def set_stage(self, stage):
@@ -162,7 +166,10 @@ class ReferenceFlow(nn.Module):
 
     def rollout_features(self, original):
         velocities, _ = self.integrate(original)
-        return velocities.flatten(1)
+        representation = velocities.flatten(1)
+        if self.config.fuse_clip_features:
+            representation = torch.cat((original, representation), dim=-1)
+        return representation
 
     def rollout(self, original):
         return self.classifier(self.rollout_features(original)).flatten()

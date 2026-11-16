@@ -10,8 +10,11 @@
 - 速度网络输入只有当前状态 z_t 和标量时间 t，输出 5120 维速度；不输入原始端点 x 或真实参考 r。
 - 真实库默认包含全部真实训练图像。每个输入从语义 Top-4 中均匀采样一个真实样本作为参考。
   参考是单张图像的五层联合特征，不使用候选特征的加权平均。
-- 从 t=1 开始做四步反向 Euler，收集四个完整速度向量。线性分类头输入为 20480 维。
+- 从 t=1 开始做四步反向 Euler，收集四个完整速度向量。默认线性分类头输入为 20480 维。
   不再重复拼接等于速度和的总校正量，不对每个样本的速度序列做 LayerNorm，以保留幅值信息。
+- `--fuse_clip_features` 开启原始 CLIP 中间特征与速度特征的直接拼接，分类头输入为
+  `[x, v_1, v_2, v_3, v_4]`，默认五层四步时为 25600 维。
+  x 使用相同五层分别 LayerNorm 后的 5120 维特征；不额外提取最终全局语义向量用于分类。
 - 默认第一阶段 5 个 epoch，第二阶段最多 5 个 epoch。第一版关闭隐藏混合、虚假库干扰与一致性损失。
 
 `--feature_layers` 可覆盖层列表；`--feature_layer 19` 显式使用旧单层表示。
@@ -62,6 +65,16 @@ python train.py --method reference_flow --arch CLIP:ViT-L/14 --feature_layers 11
 batch size 16 只是示例，应按显存调整。训练输入保留原数据管线中的在线随机裁剪、翻转及所配置的图像增强。
 不额外缓存训练图像特征、增强视图、语义邻居或速度响应。
 
+要训练 CLIP + Flow 特征融合方案，在原训练命令中添加 `--fuse_clip_features`，并使用新的 `--name`：
+
+```powershell
+python train.py --method reference_flow --arch CLIP:ViT-L/14 --feature_layers 11 12 13 14 15 --data_mode sd1_4 --wang2020_data_path D:/YOUR_DATA --real_bank_path ./feature_banks/real_layers11_15.pt --name reference_flow_fusion_v1 --checkpoints_dir ./checkpoints --batch_size 16 --num_threads 0 --flow_epochs 5 --niter 5 --flow_steps 4 --lr 0.00005 --fuse_clip_features
+```
+
+融合只改变分类头的输入，第一阶段目标、速度网络、参考检索及图像增强设置沿用原方案。
+相同 CLIP、层选择和图像表示的真实参考库可以复用。默认仍从头运行两个训练阶段；
+融合分类头的输入维度不同，需要重新训练，不能直接用旧纯速度分类头测试融合效果。
+
 ### 第一阶段：只训练速度场
 
 每批训练图像同时包含真实与生成样本，二者遵循同一参考选择规则。
@@ -91,8 +104,8 @@ for t in [1.0, 0.75, 0.5, 0.25]:
     state = state - 0.25 * velocity
 ```
 
-拼接四步预测速度，使用 BCE 训练线性分类头。
-速度特征在 no_grad 下计算，分类损失不会回传到速度场。
+拼接四步预测速度；开启融合时，在速度序列前拼接原始 CLIP 特征 x，使用 BCE 训练线性分类头。
+整个分类输入在 no_grad 下计算，分类损失只更新分类头，不回传到 CLIP 或速度场。
 不检索参考，不使用监督插值状态替代预测状态。
 每个分类 epoch 后在源域验证集评估，以准确率选择 best，固定阈值为 0.5。
 
@@ -115,6 +128,8 @@ python validate.py --ckpt ./checkpoints/reference_flow_two_stage/best --real_pat
 测试目录包含 0_real 和 1_fake。也可以使用现有的 --dataset genimage --dataset_root 路由。
 推理仅为图像 → 冻结 CLIP → 四步预测校正 → 线性分类头，不读取特征库，也不下载 CLIP。
 validate.py 会拒绝误用第一阶段 flow_final.pth，以免评估未训练的分类器。
+融合开关随 `flow_config.fuse_clip_features` 保存到 checkpoint，`validate.py` 自动恢复，测试命令无需添加融合参数。
+缺少该字段的旧 checkpoint 默认使用原来的纯速度分类头，仍按原结构加载。
 
 新 checkpoint 的 architecture_version=2。未包含该字段的旧联合训练 checkpoint 走
 models/reference_flow_legacy.py 中的原始结构加载路径，保留旧结果的推理兼容性。
@@ -135,14 +150,30 @@ python -B -m unittest test_multilayer_flow test_linear_ablation -v
 起点监督、积分方向、两阶段参数更新、训练循环与阶段 checkpoint，以及旧结构恢复。
 不代表真实数据上的检测或泛化结果。
 
-已有对照脚本现比较 A_flow（多步两阶段）、B_linear（相同静态特征的线性头）、
-C_one_step（单步两阶段），读取新训练生成的 opt.txt，沿用数据、参考库、CLIP 和训练设置：
+已有对照脚本支持 A_flow（多步两阶段）、B_linear（相同静态特征的线性头）、
+C_one_step（单步两阶段）、D_fusion（相同多步速度与原始 CLIP 特征融合），读取训练生成的 opt.txt，
+沿用数据、参考库、CLIP 和训练设置。默认运行 A/B/C，D 需要显式选择：
 
 ```powershell
 python run_flow_ablation.py --reference-opt ./checkpoints/reference_flow_two_stage/opt.txt --genimage-root D:/GenImage --prefix two_stage_v1 --dry-run
 ```
 
-检查打印命令后，去掉 --dry-run 执行；已有输出目录会被拒绝覆盖。
+已有纯速度实验时，可复用其 opt.txt，仅训练并测试融合组：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -u run_flow_ablation.py \
+  --reference-opt ./checkpoints/reference_flow_allreal_layers11_15_2stage_s4_v1/opt.txt \
+  --genimage-root /path/to/GenImage \
+  --prefix reference_flow_fusion_v1 \
+  --experiments D
+```
+
+将 GenImage 路径替换为实际目录。模型保存在 `checkpoints/reference_flow_fusion_v1_D_fusion/best`，
+结果保存在 `results/reference_flow_fusion_v1_D_fusion_genimage/`。
+也可选择 `--experiments A B D` 在同一次调用中运行三组对照。
+A/B/C 始终关闭融合、D 始终开启融合，不受输入 opt.txt 的融合开关影响。
+
+可添加 `--dry-run` 先检查生成的命令，去掉后执行；已有输出目录会被拒绝覆盖。
 该脚本不再执行旧版 C_no_flow_loss。静态参考差向量、同规模 MLP、联合训练等更完整研究对照尚未在此脚本实现。
 
 路径是人为构造的特征代理路径；中间状态不保证对应有效图像，预测终点也不保证落在某个具体真实参考上。

@@ -30,6 +30,8 @@ class TrainOptions(BaseOptions):
         opt = super().gather_options()
         if opt.niter is None:
             opt.niter = 5 if opt.method == 'reference_flow' else 100
+        if opt.fuse_clip_features and opt.method != 'reference_flow':
+            self.parser.error('--fuse_clip_features requires --method reference_flow.')
         if opt.method == 'reference_flow' and not opt.real_bank_path:
             self.parser.error('--real_bank_path is required for reference_flow; run prepare_feature_banks.py first.')
         if opt.method == 'reference_flow':

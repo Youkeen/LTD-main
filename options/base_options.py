@@ -20,6 +20,9 @@ class BaseOptions():
                                  'e.g. 11 12 13 14 15; overrides --feature_layer')
         parser.add_argument('--flow_hidden', type=int, default=512)
         parser.add_argument('--flow_steps', type=int, default=4)
+        parser.add_argument('--fuse_clip_features', action='store_true',
+                            help='prepend the same CLIP intermediate features to the predicted velocity '
+                                 'sequence before linear classification (reference_flow only)')
         parser.add_argument('--start_time_prob', type=float, default=0.1,
                             help='fraction of FM samples supervised at the exact t=1 inference start')
         parser.add_argument('--mix_prob', type=float, default=0.0, help='legacy option; must be 0 for two-stage flow')
