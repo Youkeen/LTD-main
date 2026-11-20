@@ -79,7 +79,18 @@ class RealFakeDataset(Dataset):
         assert opt.data_label in ["train", "val"]
         #assert opt.data_mode in ["ours", "wang2020", "ours_wang2020"]
         self.data_label  = opt.data_label
-        if opt.data_mode == 'ours':
+        explicit_root = getattr(opt, f'{self.data_label}_root', None)
+        if explicit_root is not None:
+            root = os.path.abspath(os.path.expanduser(explicit_root))
+            if not os.path.isdir(root):
+                raise ValueError(f'{self.data_label} directory does not exist: {root}')
+            real_list = get_list(root, must_contain='0_real')
+            fake_list = get_list(root, must_contain='1_fake')
+            if not real_list or not fake_list:
+                raise ValueError(f'{self.data_label} directory must contain real and fake images '
+                                 f'under nested 0_real/1_fake directories: {root}')
+            print(f'{self.data_label} root: {root}; real: {len(real_list)}, fake: {len(fake_list)}')
+        elif opt.data_mode == 'ours':
             pickle_name = "train.pickle" if opt.data_label=="train" else "val.pickle"
             real_list = get_list( os.path.join(opt.real_list_path, pickle_name) )
             fake_list = get_list( os.path.join(opt.fake_list_path, pickle_name) )

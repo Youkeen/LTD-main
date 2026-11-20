@@ -33,7 +33,8 @@ DATA_ROOT/
   val/1_fake/...
 ```
 
-验证集只用于源域分类模型选择；测试集使用未见生成器，不能混入训练集或参考库。
+验证集用于分类模型选择；默认采用源域 val，也可显式指定独立验证目录。
+测试集使用未参与模型选择的数据，不能混入训练集或参考库。
 训练入口检查训练与验证路径不重叠，但仍需自行保证没有跨划分的复制图像或近重复内容。
 
 ```powershell
@@ -75,6 +76,32 @@ python train.py --method reference_flow --arch CLIP:ViT-L/14 --feature_layers 11
 相同 CLIP、层选择和图像表示的真实参考库可以复用。默认仍从头运行两个训练阶段；
 融合分类头的输入维度不同，需要重新训练，不能直接用旧纯速度分类头测试融合效果。
 
+### 独立指定训练集与验证集
+
+`--train_root`、`--val_root` 优先于原有 data_mode 路由，直接递归读取指定目录下的
+`0_real` 和 `1_fake`，不会再追加 train/val 子目录。两项均未指定时沿用原有行为。
+例如，以 AIGIBench/train 训练、GenImage 验证，保留之前的融合训练设置：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -u train.py \
+  --data_mode sd1_4 \
+  --train_root /data1/yinyongqing/Data/AIGIBench/train/ \
+  --val_root /data1/yinyongqing/Data/GenImage/ \
+  --real_bank_path ./feature_banks/real_all_layers11_15.pt \
+  --feature_layers 11 12 13 14 15 \
+  --lr 0.00005 \
+  --batch_size 256 --loadSize 256 --cropSize 224 \
+  --fix_backbone --fuse_clip_features \
+  --name reference_flow_allreal_layers11_15_2stage_s4_fusion_genimageval_v1
+```
+
+训练和验证使用独立的数据加载器；两个训练阶段仍使用同一个训练集。
+验证关闭 JPEG/模糊随机增强及类别平衡随机采样，采用中心裁剪。
+GenImage 全部匹配图像会合并验证，按固定阈值 0.5 的总体准确率保存 best，
+该指标按图像数量加权，不是 validate.py 输出 CSV 的逐生成器宏平均。
+参考库仍只允许包含当前训练集的真实图像；训练图像、CLIP 权重及层配置不变时可复用原库。
+一旦采用 GenImage 选择 best，GenImage 就属于验证数据；最终泛化结果应在另一份独立测试集上报告。
+
 ### 第一阶段：只训练速度场
 
 每批训练图像同时包含真实与生成样本，二者遵循同一参考选择规则。
@@ -107,13 +134,13 @@ for t in [1.0, 0.75, 0.5, 0.25]:
 拼接四步预测速度；开启融合时，在速度序列前拼接原始 CLIP 特征 x，使用 BCE 训练线性分类头。
 整个分类输入在 no_grad 下计算，分类损失只更新分类头，不回传到 CLIP 或速度场。
 不检索参考，不使用监督插值状态替代预测状态。
-每个分类 epoch 后在源域验证集评估，以准确率选择 best，固定阈值为 0.5。
+每个分类 epoch 后在指定验证集评估，以准确率选择 best，固定阈值为 0.5。
 
 输出位于 checkpoints/reference_flow_two_stage/：
 
 - flow_final.pth：第一阶段完成后的速度场和冻结 CLIP；分类器尚未训练，不能用于真假评估。
 - model_epoch_N.pth：第二阶段各保存轮次的完整模型。
-- best：源域验证准确率最优的第二阶段模型，用于最终测试。
+- best：指定验证集准确率最优的第二阶段模型，用于最终测试。
 - opt.txt、train/、val/：参数和按阶段分开的 TensorBoard 记录。
 
 checkpoint 包含完整 CLIP、速度网络、分类头、结构版本、训练阶段及优化器状态。
@@ -172,6 +199,12 @@ CUDA_VISIBLE_DEVICES=1 python -u run_flow_ablation.py \
 结果保存在 `results/reference_flow_fusion_v1_D_fusion_genimage/`。
 也可选择 `--experiments A B D` 在同一次调用中运行三组对照。
 A/B/C 始终关闭融合、D 始终开启融合，不受输入 opt.txt 的融合开关影响。
+
+`--genimage-root` 只指定训练后的测试目录。训练目录默认读取原 `opt.txt` 中的
+`wang2020_data_path`，支持 `<root>/{train,val}/**/{0_real,1_fake}` 的嵌套类别结构。
+若原数据目录迁移，可添加 `--train-root /actual/source/training/root` 覆盖本次训练路径，
+原 opt.txt 保持不变。该目录应对应原实验的源域训练/验证划分；已有参考库中的训练路径也须与其匹配。
+启动时会分别打印训练根目录及其来源、GenImage 测试根目录。
 
 可添加 `--dry-run` 先检查生成的命令，去掉后执行；已有输出目录会被拒绝覆盖。
 该脚本不再执行旧版 C_no_flow_loss。静态参考差向量、同规模 MLP、联合训练等更完整研究对照尚未在此脚本实现。

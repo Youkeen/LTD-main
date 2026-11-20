@@ -6,15 +6,19 @@ from options.train_options import TrainOptions
 import numpy as np
 import torch
 import random
+from copy import deepcopy
 
 
-def get_val_opt():
-    val_opt = TrainOptions().parse(print_options=False)
+def get_val_opt(opt=None):
+    val_opt = deepcopy(opt) if opt is not None else TrainOptions().parse(print_options=False)
     val_opt.isTrain = False
     val_opt.no_resize = False
     val_opt.no_crop = False
     val_opt.serial_batches = True
+    val_opt.class_bal = False
     val_opt.data_label = 'val'
+    val_opt.blur_prob = 0
+    val_opt.jpg_prob = 0
     val_opt.jpg_method = ['pil']
     if len(val_opt.blur_sig) == 2:
         b_sig = val_opt.blur_sig
@@ -76,7 +80,7 @@ def main():
     from validate import validate
     from data import create_dataloader
 
-    val_opt = get_val_opt()
+    val_opt = get_val_opt(opt)
     set_seed(3000)
 
     model = Trainer(opt)
@@ -90,7 +94,7 @@ def main():
         if train_paths & val_paths:
             raise ValueError('Training and validation paths overlap. Use separate splits before training.')
     if len(data_loader) == 0 or len(val_loader) == 0:
-        raise ValueError('Training and source validation loaders must both be nonempty.')
+        raise ValueError('Training and validation loaders must both be nonempty.')
     model.initialize_bank(data_loader.dataset)
 
 
